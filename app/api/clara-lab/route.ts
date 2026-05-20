@@ -31,7 +31,8 @@ export async function POST(request: Request) {
   const model = body.model?.trim() || CLARA_MODEL;
   const temperature = clampNumber(body.temperature, 0, 2, CLARA_DEFAULT_TEMPERATURE);
   const maxTokens = Math.round(clampNumber(body.maxTokens, 40, 800, CLARA_DEFAULT_MAX_TOKENS));
-  const userPrompt = buildLabUserPrompt({ transcript, opener, memory, depth });
+  const responseGuidance = buildResponseGuidance(transcript);
+  const userPrompt = buildLabUserPrompt({ transcript, opener, memory, depth, responseGuidance });
   const debugPrompt = {
     model,
     temperature,
@@ -111,18 +112,122 @@ function buildLabUserPrompt({
   transcript,
   opener,
   memory,
-  depth
-}: Pick<Required<LabRequest>, "transcript" | "opener" | "memory" | "depth">) {
+  depth,
+  responseGuidance
+}: Pick<Required<LabRequest>, "transcript" | "opener" | "memory" | "depth"> & {
+  responseGuidance: ResponseGuidance;
+}) {
   return JSON.stringify(
     {
       task: "Write Clara's next response. Do not run extraction. Read the transcript for meaning and respond as Clara.",
       opener,
       memory,
       depth,
+      responseGuidance,
       transcript
     },
     null,
     2
+  );
+}
+
+type ResponseMove = "reflect_only" | "gentle_question" | "witness" | "save" | "close" | "continue";
+
+type ResponseGuidance = {
+  suggestedMove: ResponseMove;
+  latestUserText: string;
+  seriousLifeEvent: boolean;
+  continueRequested: boolean;
+  recentQuestionLedReplies: number;
+  instructions: string[];
+};
+
+function buildResponseGuidance(transcript: string): ResponseGuidance {
+  const latestUserText = latestUserLine(transcript);
+  const seriousLifeEvent = isSeriousLifeEvent(latestUserText);
+  const continueRequested = isContinueSignal(latestUserText);
+  const recentQuestionLedReplies = countRecentQuestionLedClaraReplies(transcript);
+  const instructions: string[] = [
+    "Use one of these response moves: reflect_only, gentle_question, witness, save, close, continue.",
+    "Do not ask more than two question-led Clara responses in a row.",
+    "A response may have no question."
+  ];
+  let suggestedMove: ResponseMove = "gentle_question";
+
+  if (seriousLifeEvent) {
+    suggestedMove = "witness";
+    instructions.push(
+      "Serious life event detected. Respond with immediate warmth and gravity.",
+      "Do not use generic flow-control language.",
+      "Do not ask whether the user wants to stay with this.",
+      "Do not rush to save or close."
+    );
+  } else if (continueRequested) {
+    suggestedMove = "continue";
+    instructions.push(
+      "The user asked to continue. Do not save or close.",
+      "Continue the same thread with one grounded response."
+    );
+  } else if (recentQuestionLedReplies >= 2) {
+    suggestedMove = "reflect_only";
+    instructions.push("The last Clara replies were question-led. Prefer a reflective response with no question.");
+  }
+
+  return {
+    suggestedMove,
+    latestUserText,
+    seriousLifeEvent,
+    continueRequested,
+    recentQuestionLedReplies,
+    instructions
+  };
+}
+
+function latestUserLine(transcript: string) {
+  const line = transcript
+    .split("\n")
+    .reverse()
+    .find((item) => item.trim().toLowerCase().startsWith("user:"));
+
+  return line?.replace(/^user:\s*/i, "").trim() ?? "";
+}
+
+function countRecentQuestionLedClaraReplies(transcript: string) {
+  const claraLines = transcript
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.toLowerCase().startsWith("clara:"))
+    .map((line) => line.replace(/^clara:\s*/i, "").trim());
+
+  let count = 0;
+
+  for (const line of claraLines.reverse()) {
+    if (line.endsWith("?")) {
+      count += 1;
+      continue;
+    }
+
+    break;
+  }
+
+  return count;
+}
+
+function isContinueSignal(text: string) {
+  return ["keep going", "continue", "say more", "go deeper"].includes(text.trim().toLowerCase());
+}
+
+function isSeriousLifeEvent(text: string) {
+  const lower = text.toLowerCase();
+  return (
+    /\b(dying|died|death|dead|grief|grieving|funeral|hospice|terminal)\b/.test(lower) ||
+    /\b(cancer|stroke|heart attack|very sick|seriously ill|terrible news)\b/.test(lower) ||
+    /\b(father-in-law|mother-in-law|dad|mom|father|mother|parent|spouse|partner|child|friend)\b.*\b(dying|cancer|very sick|terminal|hospice)\b/.test(
+      lower
+    ) ||
+    /\b(dying|cancer|very sick|terminal|hospice)\b.*\b(father-in-law|mother-in-law|dad|mom|father|mother|parent|spouse|partner|child|friend)\b/.test(
+      lower
+    )
   );
 }
 

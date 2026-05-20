@@ -161,13 +161,13 @@ const STORAGE_KEYS = {
 
 const APP_STORAGE_PREFIXES = ["whyld-world-", "whyld-", "clara-"];
 
-const openers = [
-  "How was your day?",
-  "What stood out today?",
-  "What actually mattered today?",
-  "What gave you energy today?",
-  "What took energy from you today?"
-];
+const timeAwareOpeners = {
+  morning: "What's on your mind this morning?",
+  midday: "How is today going so far?",
+  afternoon: "What's been taking your attention today?",
+  evening: "How was your day?",
+  night: "Anything from today still with you?"
+};
 
 const tagLexicon: Record<ThemeTag, string[]> = {
   stress: [
@@ -369,10 +369,13 @@ const starterProfile: Profile = {
 };
 
 function todayOpener() {
-  const start = new Date(new Date().getFullYear(), 0, 0);
-  const diff = Number(new Date()) - Number(start);
-  const day = Math.floor(diff / 86400000);
-  return openers[day % openers.length];
+  const hour = new Date().getHours();
+
+  if (hour >= 5 && hour < 11) return timeAwareOpeners.morning;
+  if (hour >= 11 && hour < 14) return timeAwareOpeners.midday;
+  if (hour >= 14 && hour < 17) return timeAwareOpeners.afternoon;
+  if (hour >= 17 && hour < 22) return timeAwareOpeners.evening;
+  return timeAwareOpeners.night;
 }
 
 function makeUserMessage(text: string): UserMessage {
@@ -936,6 +939,7 @@ function isStoppingSignal(text: string) {
 }
 
 function shouldCloseForDepth(session: CurrentSession, latestReply: string) {
+  if (isContinueSignal(latestReply)) return false;
   if (isStoppingSignal(latestReply)) return true;
   return false;
 }
@@ -943,7 +947,7 @@ function shouldCloseForDepth(session: CurrentSession, latestReply: string) {
 function maybeApplyDepthCheck(session: CurrentSession) {
   if (session.userDepthSignal === "low" || session.turnCount < 3) return session;
   const lastUserText = [...session.messages].reverse().find((message) => message.role === "user")?.text ?? "";
-  if (isCorrectionSignal(lastUserText) || normalizeChoice(lastUserText) === "keep going") return session;
+  if (isCorrectionSignal(lastUserText) || isContinueSignal(lastUserText) || isSeriousLifeEvent(lastUserText)) return session;
 
   const shouldCheck =
     (session.userDepthSignal === "medium" && session.turnCount === 4) ||
@@ -956,7 +960,7 @@ function maybeApplyDepthCheck(session: CurrentSession) {
   if (!lastMessage || lastMessage.role !== "clara" || lastMessage.expectedInput !== "text") return session;
 
   messages[messages.length - 1] = makeClaraMessage({
-    text: "Do you want to stay with this a bit longer?",
+    text: "Do you want to keep going, or save this for now?",
     expectedInput: "choice",
     choices: ["Keep going", "Save this", "Done for today"]
   });
@@ -978,6 +982,24 @@ function isCorrectionSignal(text: string) {
     /^no[, ]/.test(lower) ||
     /\bno,? actually\b/.test(lower) ||
     /\bactually\b/.test(lower)
+  );
+}
+
+function isContinueSignal(text: string) {
+  return ["keep going", "continue", "say more", "go deeper"].includes(normalizeChoice(text));
+}
+
+function isSeriousLifeEvent(text: string) {
+  const lower = text.toLowerCase();
+  return (
+    /\b(dying|died|death|dead|grief|grieving|funeral|hospice|terminal)\b/.test(lower) ||
+    /\b(cancer|stroke|heart attack|very sick|seriously ill|terrible news)\b/.test(lower) ||
+    /\b(father-in-law|mother-in-law|dad|mom|father|mother|parent|spouse|partner|child|friend)\b.*\b(dying|cancer|very sick|terminal|hospice)\b/.test(
+      lower
+    ) ||
+    /\b(dying|cancer|very sick|terminal|hospice)\b.*\b(father-in-law|mother-in-law|dad|mom|father|mother|parent|spouse|partner|child|friend)\b/.test(
+      lower
+    )
   );
 }
 
@@ -1221,8 +1243,12 @@ function fallbackConversationText(session: CurrentSession) {
   const latestUser = [...session.messages].reverse().find((message) => message.role === "user")?.text ?? "";
   const lower = latestUser.toLowerCase();
 
-  if (normalizeChoice(latestUser) === "keep going") {
+  if (isContinueSignal(latestUser)) {
     return "Okay. What feels worth staying with from here?";
+  }
+
+  if (isSeriousLifeEvent(latestUser)) {
+    return "I'm really sorry. That's a lot to have close to you. Do you want to say what today has been like with that in the background?";
   }
 
   if (isCorrectionSignal(latestUser)) {
