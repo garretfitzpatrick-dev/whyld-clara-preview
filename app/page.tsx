@@ -2,8 +2,10 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
-type Depth = "Light" | "Thoughtful" | "Deep";
-type EngineDepth = "light" | "thoughtful" | "deep";
+type Depth = "keep_it_light" | "go_a_little_deeper";
+type DepthLabel = "Keep it light" | "Go a little deeper";
+type EngineDepth = Depth;
+type StoredDepth = Depth | DepthLabel | "Light" | "Thoughtful" | "Deep" | "light" | "thoughtful" | "deep";
 type Tab = "Today" | "Moments" | "Meaning" | "History" | "Recap" | "Settings";
 type LengthBucket = "short" | "medium" | "long";
 type Sentiment = "positive" | "neutral" | "negative";
@@ -12,6 +14,13 @@ type SessionStatus = "active" | "closed";
 type ExpectedInput = "choice" | "text" | "none";
 type ThreadSource = "clara" | "user";
 type UserDepthSignal = "low" | "medium" | "high";
+type UserIntent =
+  | "substantive_response"
+  | "acknowledgement"
+  | "polite_close"
+  | "explicit_continue"
+  | "correction"
+  | "explicit_stop";
 type TouchpointType =
   | "daily_check_in"
   | "morning_orientation"
@@ -109,7 +118,7 @@ type LegacyEntry = {
   question: string;
   response: string;
   tags: ThemeTag[];
-  depth: Depth;
+  depth: StoredDepth;
   clara: string;
 };
 
@@ -150,6 +159,10 @@ type ClaraLabResponse = {
   error?: string;
   detail?: string;
   fallbackUsed?: boolean;
+};
+
+type UserIntentContext = {
+  userIntent: UserIntent;
 };
 
 type MeaningNoteResponse = {
@@ -411,7 +424,7 @@ const tagQuestions: Record<ThemeTag, string> = {
 const starterProfile: Profile = {
   wantsMore: "",
   drainsEnergy: "",
-  depth: "Thoughtful"
+  depth: "go_a_little_deeper"
 };
 
 function todayOpener() {
@@ -510,7 +523,9 @@ function chooseResponseStrategy(classification: EntryClassification, selectedDep
   if (repeated.has("stress")) return "pattern_notice";
   if (repeated.has("family") && (repeated.has("joy") || classification.themes.includes("joy"))) return "save_bright_spot";
   if (classification.sentiment === "negative" && classification.lengthBucket === "long") return "downshift";
-  if (selectedDepth === "deep" || classification.suggestedDepth === "deep") return "offer_depth_choice";
+  if (selectedDepth === "go_a_little_deeper" || classification.suggestedDepth === "go_a_little_deeper") {
+    return "offer_depth_choice";
+  }
   if (classification.sentiment === "positive") return "save_bright_spot";
   if (classification.lengthBucket === "short") return "acknowledge";
   if (classification.sentiment === "negative") return "ask_followup";
@@ -990,7 +1005,7 @@ function withDepthState(session: CurrentSession, userText: string): CurrentSessi
 }
 
 function isStoppingSignal(text: string) {
-  return ["that's it", "thats it", "nothing else", "done", "i'm done", "im done", "all good"].includes(
+  return ["that's it", "thats it", "nothing else", "done", "i'm done", "im done", "all good", "that's enough", "thats enough"].includes(
     normalizeChoice(text)
   );
 }
@@ -1031,9 +1046,13 @@ function maybeApplyDepthCheck(session: CurrentSession) {
 function isCorrectionSignal(text: string) {
   const lower = text.toLowerCase().trim();
   return (
+    /\bi didn'?t mean\b/.test(lower) ||
+    /\bi didnt mean\b/.test(lower) ||
     /\bi didn'?t say\b/.test(lower) ||
     /\bthat's not what i meant\b/.test(lower) ||
     /\bthats not what i meant\b/.test(lower) ||
+    /\bthat's not what i said\b/.test(lower) ||
+    /\bthats not what i said\b/.test(lower) ||
     /\bnot exactly\b/.test(lower) ||
     /\bi mean\b/.test(lower) ||
     /^no[, ]/.test(lower) ||
@@ -1044,6 +1063,104 @@ function isCorrectionSignal(text: string) {
 
 function isContinueSignal(text: string) {
   return ["keep going", "continue", "say more", "go deeper"].includes(normalizeChoice(text));
+}
+
+function detectUserIntent(text: string, session: CurrentSession): UserIntent {
+  if (isContinueSignal(text)) return "explicit_continue";
+  if (isExplicitStopSignal(text) || isCloseChoice(text) || isStoppingSignal(text)) return "explicit_stop";
+  if (isCorrectionSignal(text)) return "correction";
+
+  if (isAcknowledgement(text)) {
+    const previousUserMessage = [...session.messages].reverse().find((message) => message.role === "user")?.text ?? "";
+    const previousUserIntent = previousUserMessage ? detectUserIntent(previousUserMessage, emptyIntentSession()) : null;
+
+    if (previousUserIntent === "acknowledgement" || previousUserIntent === "polite_close") {
+      return "polite_close";
+    }
+
+    if (previousClaraRespondedSubstantively(session)) {
+      return "polite_close";
+    }
+
+    return "acknowledgement";
+  }
+
+  return "substantive_response";
+}
+
+function emptyIntentSession(): CurrentSession {
+  return {
+    sessionId: "intent",
+    startedAt: new Date(0).toISOString(),
+    messages: [],
+    currentDepth: "keep_it_light",
+    status: "active",
+    activeThread: null,
+    threadSource: "clara",
+    threadConfidence: 0,
+    awaitingThreadRedirect: false,
+    threadCorrectionOffered: false,
+    turnCount: 0,
+    userDepthSignal: "low",
+    touchpointType: "daily_check_in"
+  };
+}
+
+function previousClaraRespondedSubstantively(session: CurrentSession) {
+  const latestClaraIndex = findLastMessageIndex(session.messages, "clara");
+  const latestUserIndex = findLastMessageIndex(session.messages, "user");
+
+  return latestClaraIndex > 0 && latestUserIndex >= 0 && latestClaraIndex > latestUserIndex;
+}
+
+function findLastMessageIndex(messages: ConversationMessage[], role: MessageRole) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === role) return index;
+  }
+
+  return -1;
+}
+
+function isAcknowledgement(text: string) {
+  return [
+    "thanks",
+    "thank you",
+    "thx",
+    "okay",
+    "ok",
+    "got it",
+    "makes sense",
+    "yep",
+    "yeah",
+    "cool",
+    "sounds good"
+  ].includes(normalizeConversationalSignal(text));
+}
+
+function isExplicitStopSignal(text: string) {
+  return ["done", "leave it there", "stop", "that's enough", "thats enough"].includes(normalizeConversationalSignal(text));
+}
+
+function normalizeConversationalSignal(text: string) {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?]+$/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function politeCloseText(text: string) {
+  const normalized = normalizeConversationalSignal(text);
+
+  if (normalized === "thanks" || normalized === "thank you" || normalized === "thx") {
+    return "You're welcome. We can leave it there.";
+  }
+
+  if (normalized === "ok" || normalized === "okay" || normalized === "got it") {
+    return "Of course. I'll save this for now.";
+  }
+
+  return "Glad we touched on it. I'll keep this with today.";
 }
 
 function isSeriousLifeEvent(text: string) {
@@ -1106,11 +1223,11 @@ function chooseSuggestedDepth(
   hasPattern: boolean,
   repeatedThemes: ThemeTag[]
 ): EngineDepth {
-  if (sentiment === "negative" && lengthBucket === "long") return "light";
-  if (hasPattern && repeatedThemes.includes("stress")) return "thoughtful";
-  if (lengthBucket === "long" || hasPattern) return "deep";
-  if (lengthBucket === "short") return "light";
-  return "thoughtful";
+  if (sentiment === "negative" && lengthBucket === "long") return "keep_it_light";
+  if (hasPattern && repeatedThemes.includes("stress")) return "go_a_little_deeper";
+  if (lengthBucket === "long" || hasPattern) return "go_a_little_deeper";
+  if (lengthBucket === "short") return "keep_it_light";
+  return "go_a_little_deeper";
 }
 
 function intentForTemplateText(
@@ -1257,14 +1374,27 @@ async function generateClaraText(intent: ResponseIntent) {
 async function generateClaraFromConversation(
   session: CurrentSession,
   profile: Profile | null,
-  previousSessions: CompletedSession[]
+  previousSessions: CompletedSession[],
+  intentContext?: UserIntentContext
 ): Promise<ClaraTextResult> {
   const transcript = sessionTranscript(session, 10);
   const opener = sessionOpener(session);
-  const memory = [profileMemory(profile, previousSessions), sessionTouchpointContext(session)].filter(Boolean).join("\n");
+  const memory = [
+    profileMemory(profile, previousSessions),
+    sessionTouchpointContext(session),
+    intentContext ? `Detected user intent: ${intentContext.userIntent}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   try {
-    console.log("Calling Clara lab-style route", { opener, transcript, memory, depth: session.currentDepth });
+    console.log("Calling Clara lab-style route", {
+      opener,
+      transcript,
+      memory,
+      depth: session.currentDepth,
+      userIntent: intentContext?.userIntent
+    });
     const response = await fetch("/api/clara-lab", {
       method: "POST",
       headers: {
@@ -1274,7 +1404,8 @@ async function generateClaraFromConversation(
         opener,
         transcript,
         memory,
-        depth: session.currentDepth
+        depth: session.currentDepth,
+        userIntent: intentContext?.userIntent
       })
     });
 
@@ -1578,14 +1709,23 @@ function isToday(value: string) {
   return new Date(value).toDateString() === new Date().toDateString();
 }
 
-function depthToEngine(depth: Depth): EngineDepth {
-  return depth.toLowerCase() as EngineDepth;
+function depthToEngine(depth: StoredDepth): EngineDepth {
+  return normalizeEngineDepth(depth);
 }
 
-function engineToDepth(depth: EngineDepth): Depth {
-  if (depth === "light") return "Light";
-  if (depth === "deep") return "Deep";
-  return "Thoughtful";
+function engineToDepth(depth: EngineDepth): DepthLabel {
+  return depth === "keep_it_light" ? "Keep it light" : "Go a little deeper";
+}
+
+function normalizeEngineDepth(depth: unknown): EngineDepth {
+  if (depth === "keep_it_light" || depth === "Keep it light" || depth === "light" || depth === "Light") {
+    return "keep_it_light";
+  }
+  return "go_a_little_deeper";
+}
+
+function normalizeDepth(depth: unknown): Depth {
+  return normalizeEngineDepth(depth);
 }
 
 function sessionText(session: CurrentSession) {
@@ -1612,7 +1752,7 @@ function profileMemory(profile: Profile | null, sessions: CompletedSession[]) {
   if (profile) {
     if (profile.wantsMore.trim()) lines.push(`Wants more: ${profile.wantsMore.trim()}`);
     if (profile.drainsEnergy.trim()) lines.push(`Takes energy: ${profile.drainsEnergy.trim()}`);
-    lines.push(`Preferred depth: ${profile.depth}`);
+    lines.push(`Preferred response mode: ${engineToDepth(profile.depth)} (${profile.depth})`);
   }
 
   sessions
@@ -1690,7 +1830,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isEngineDepth(value: unknown): value is EngineDepth {
-  return value === "light" || value === "thoughtful" || value === "deep";
+  return (
+    value === "keep_it_light" ||
+    value === "go_a_little_deeper" ||
+    value === "light" ||
+    value === "thoughtful" ||
+    value === "deep"
+  );
 }
 
 function isSessionStatus(value: unknown): value is SessionStatus {
@@ -1773,6 +1919,7 @@ function isMeaningNote(value: unknown): value is MeaningNote {
 function normalizeSession(session: CurrentSession): CurrentSession {
   return {
     ...session,
+    currentDepth: normalizeEngineDepth(session.currentDepth),
     activeThread: typeof session.activeThread === "string" ? session.activeThread : null,
     threadSource: session.threadSource === "user" || session.threadSource === "clara" ? session.threadSource : "clara",
     threadConfidence: typeof session.threadConfidence === "number" ? session.threadConfidence : 0,
@@ -1816,15 +1963,18 @@ function normalizeSession(session: CurrentSession): CurrentSession {
 }
 
 function readProfileFromStorage(): Profile | null {
-  const profile = parseStoredJson<Profile>(window.localStorage.getItem(STORAGE_KEYS.profile));
+  const profile = parseStoredJson<Profile & { depth?: unknown }>(window.localStorage.getItem(STORAGE_KEYS.profile));
 
   if (
     profile &&
     typeof profile.wantsMore === "string" &&
-    typeof profile.drainsEnergy === "string" &&
-    ["Light", "Thoughtful", "Deep"].includes(profile.depth)
+    typeof profile.drainsEnergy === "string"
   ) {
-    return profile;
+    return {
+      wantsMore: profile.wantsMore,
+      drainsEnergy: profile.drainsEnergy,
+      depth: normalizeDepth(profile.depth)
+    };
   }
 
   if (window.localStorage.getItem(STORAGE_KEYS.profile)) {
@@ -1955,6 +2105,7 @@ export default function Home() {
     if (parsedProfile) {
       setProfile(parsedProfile);
       setDraftProfile(parsedProfile);
+      window.localStorage.setItem(STORAGE_KEYS.profile, JSON.stringify(parsedProfile));
     }
 
     setSessions(parsedSessions);
@@ -2056,6 +2207,23 @@ export default function Home() {
       return;
     }
 
+    const detectedUserIntent = detectUserIntent(trimmed, currentSession);
+    console.log("detectedUserIntent", detectedUserIntent);
+
+    if (detectedUserIntent === "polite_close") {
+      const closeReason = "polite_close";
+      console.log("closeReason", closeReason);
+      await closeSession(trimmed, politeCloseText(trimmed));
+      return;
+    }
+
+    if (detectedUserIntent === "explicit_stop") {
+      const closeReason = "explicit_stop";
+      console.log("closeReason", closeReason);
+      await closeSession(trimmed, "Of course. I'll save this for now.");
+      return;
+    }
+
     if (isCloseChoice(trimmed)) {
       await closeSession(trimmed);
       return;
@@ -2086,7 +2254,9 @@ export default function Home() {
         awaitingThreadRedirect: false,
         threadCorrectionOffered: true
       };
-      const claraResult = await generateClaraFromConversation(redirectedSession, profile, sessions);
+      const claraResult = await generateClaraFromConversation(redirectedSession, profile, sessions, {
+        userIntent: detectedUserIntent
+      });
       setCurrentSession(maybeApplyDepthCheck({
         ...redirectedSession,
         messages: [
@@ -2102,7 +2272,9 @@ export default function Home() {
     }
 
     if (isThreadCorrectionChoice && (normalizeChoice(trimmed) === "yes, that" || normalizeChoice(trimmed) === "yes that")) {
-      const claraResult = await generateClaraFromConversation(sessionWithReply, profile, sessions);
+      const claraResult = await generateClaraFromConversation(sessionWithReply, profile, sessions, {
+        userIntent: detectedUserIntent
+      });
       setCurrentSession(maybeApplyDepthCheck({
         ...sessionWithReply,
         awaitingThreadRedirect: false,
@@ -2118,7 +2290,9 @@ export default function Home() {
       return;
     }
 
-    const claraResult = await generateClaraFromConversation(sessionWithReply, profile, sessions);
+    const claraResult = await generateClaraFromConversation(sessionWithReply, profile, sessions, {
+      userIntent: detectedUserIntent
+    });
     setCurrentSession(
       maybeApplyDepthCheck({
         ...sessionWithReply,
@@ -2142,7 +2316,7 @@ export default function Home() {
         userText: trimmed,
         themes: focusFields.themes,
         sentiment: "neutral",
-        depth: "thoughtful",
+        depth: "go_a_little_deeper",
         repeatedThemes: [],
         keyElements: focusFields.keyElements,
         focusElement: focusFields.focusElement,
@@ -2160,7 +2334,7 @@ export default function Home() {
       const nextSession = applyThreadLock(
         {
           ...sessionWithReply,
-          currentDepth: "thoughtful",
+          currentDepth: "go_a_little_deeper",
           messages: [
             ...sessionWithReply.messages,
             makeClaraMessage({
@@ -2191,7 +2365,7 @@ export default function Home() {
         userText: trimmed,
         themes: focusFields.themes,
         sentiment: "neutral",
-        depth: "deep",
+        depth: "go_a_little_deeper",
         repeatedThemes: [],
         keyElements: focusFields.keyElements,
         focusElement: focusFields.focusElement,
@@ -2209,7 +2383,7 @@ export default function Home() {
       const nextSession = applyThreadLock(
         {
           ...sessionWithReply,
-          currentDepth: "deep",
+          currentDepth: "go_a_little_deeper",
           messages: [
             ...sessionWithReply.messages,
             makeClaraMessage({
@@ -2240,7 +2414,7 @@ export default function Home() {
         userText: trimmed,
         themes: focusFields.themes,
         sentiment: "neutral",
-        depth: "light",
+        depth: "keep_it_light",
         repeatedThemes: [],
         keyElements: focusFields.keyElements,
         focusElement: focusFields.focusElement,
@@ -2258,7 +2432,7 @@ export default function Home() {
       const nextSession = applyThreadLock(
         {
           ...sessionWithReply,
-          currentDepth: "light",
+          currentDepth: "keep_it_light",
           messages: [
             ...sessionWithReply.messages,
             makeClaraMessage({
@@ -2477,7 +2651,7 @@ export default function Home() {
             "Review these saved Meaning Notes. Generate one plain-language weekly thread in 1-2 sentences, then ask exactly: Does that feel true?",
           opener: "Weekly Meaning Thread",
           memory: profileMemory(profile, sessions),
-          depth: profile ? depthToEngine(profile.depth) : "thoughtful",
+          depth: profile ? depthToEngine(profile.depth) : "go_a_little_deeper",
           transcript: weeklyMeaningNotesTranscript(weeklyMeaningNotes)
         })
       });
@@ -2600,7 +2774,7 @@ export default function Home() {
             className="rounded-md border border-pearl/15 px-3 py-2 text-sm text-fog"
             onClick={() => setTab("Settings")}
           >
-            {currentSession ? engineToDepth(currentSession.currentDepth) : profile.depth}
+            {currentSession ? engineToDepth(currentSession.currentDepth) : engineToDepth(profile.depth)}
           </button>
         </div>
       </header>
@@ -2976,9 +3150,9 @@ function Field({
 function DepthPicker({ value, onChange }: { value: Depth; onChange: (depth: Depth) => void }) {
   return (
     <div className="space-y-3">
-      <p className="text-base text-fog">How deep should Clara usually go?</p>
-      <div className="grid grid-cols-3 gap-2">
-        {(["Light", "Thoughtful", "Deep"] as Depth[]).map((depth) => (
+      <p className="text-base text-fog">How should Clara usually respond?</p>
+      <div className="grid grid-cols-2 gap-2">
+        {(["keep_it_light", "go_a_little_deeper"] as Depth[]).map((depth) => (
           <button
             className={`rounded-md border px-3 py-3 text-sm transition ${
               value === depth
@@ -2989,7 +3163,7 @@ function DepthPicker({ value, onChange }: { value: Depth; onChange: (depth: Dept
             onClick={() => onChange(depth)}
             type="button"
           >
-            {depth}
+            {engineToDepth(depth)}
           </button>
         ))}
       </div>

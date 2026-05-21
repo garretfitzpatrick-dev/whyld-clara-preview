@@ -12,6 +12,7 @@ type LabRequest = {
   opener?: string;
   memory?: string;
   depth?: string;
+  userIntent?: UserIntent;
   model?: string;
   temperature?: number;
   maxTokens?: number;
@@ -32,10 +33,11 @@ export async function POST(request: Request) {
   const opener = body.opener?.trim() ?? "";
   const memory = body.memory?.trim() ?? "";
   const depth = body.depth?.trim() ?? "";
+  const userIntent = isUserIntent(body.userIntent) ? body.userIntent : detectUserIntentFromTranscript(transcript);
   const model = body.model?.trim() || CLARA_MODEL;
   const temperature = clampNumber(body.temperature, 0, 2, CLARA_DEFAULT_TEMPERATURE);
   const maxTokens = Math.round(clampNumber(body.maxTokens, 40, 800, CLARA_DEFAULT_MAX_TOKENS));
-  const responseGuidance = buildResponseGuidance(transcript);
+  const responseGuidance = buildResponseGuidance(transcript, userIntent, depth);
   const userPrompt = buildLabUserPrompt({ task, transcript, opener, memory, depth, responseGuidance });
   const debugPrompt = {
     model,
@@ -136,30 +138,43 @@ function buildLabUserPrompt({
   );
 }
 
+type UserIntent =
+  | "substantive_response"
+  | "acknowledgement"
+  | "polite_close"
+  | "explicit_continue"
+  | "correction"
+  | "explicit_stop";
+
 type ResponseMove = "reflect_only" | "gentle_question" | "witness" | "save" | "close" | "continue";
 
 type ResponseGuidance = {
   suggestedMove: ResponseMove;
   latestUserText: string;
+  userIntent: UserIntent;
   seriousLifeEvent: boolean;
   continueRequested: boolean;
   recentQuestionLedReplies: number;
   instructions: string[];
 };
 
-function buildResponseGuidance(transcript: string): ResponseGuidance {
+function buildResponseGuidance(transcript: string, userIntent: UserIntent, depth: string): ResponseGuidance {
   const latestUserText = latestUserLine(transcript);
   const seriousLifeEvent = isSeriousLifeEvent(latestUserText);
-  const continueRequested = isContinueSignal(latestUserText);
+  const continueRequested = userIntent === "explicit_continue" || isContinueSignal(latestUserText);
   const recentQuestionLedReplies = countRecentQuestionLedClaraReplies(transcript);
   const instructions: string[] = [
     "Use one of these response moves: reflect_only, gentle_question, witness, save, close, continue.",
     "Do not ask more than two question-led Clara responses in a row.",
-    "A response may have no question."
+    "A response may have no question.",
+    `Detected userIntent: ${userIntent}. Use it as conversational pragmatics, not user-facing text.`
   ];
   let suggestedMove: ResponseMove = "gentle_question";
 
-  if (seriousLifeEvent) {
+  if (userIntent === "polite_close" || userIntent === "explicit_stop") {
+    suggestedMove = "close";
+    instructions.push("The user is closing. Respond briefly and do not ask another reflective question.");
+  } else if (seriousLifeEvent) {
     suggestedMove = "witness";
     instructions.push(
       "Serious life event detected. Respond with immediate warmth and gravity.",
@@ -173,19 +188,63 @@ function buildResponseGuidance(transcript: string): ResponseGuidance {
       "The user asked to continue. Do not save or close.",
       "Continue the same thread with one grounded response."
     );
+  } else if (userIntent === "acknowledgement") {
+    suggestedMove = "reflect_only";
+    instructions.push("The user acknowledged. Keep it brief; acknowledgments often signal closure.");
+  } else if (userIntent === "correction") {
+    suggestedMove = "gentle_question";
+    instructions.push("The user corrected Clara. Repair naturally before continuing.");
   } else if (recentQuestionLedReplies >= 2) {
     suggestedMove = "reflect_only";
     instructions.push("The last Clara replies were question-led. Prefer a reflective response with no question.");
   }
 
+  if (depth === "keep_it_light") {
+    instructions.push(
+      "Response mode is Keep it light: stay brief, lower pressure, use fewer follow-up questions, and be more willing to save or close after one good exchange.",
+      "Light warmth or very mild humor is okay only when the topic is casual; never joke about serious topics."
+    );
+  }
+
+  if (depth === "go_a_little_deeper") {
+    instructions.push(
+      "Response mode is Go a little deeper: when the user gives substance, Clara may ask a second or third grounded question and explore tensions, patterns, tradeoffs, values, or identity.",
+      "Still avoid guru language, therapy framing, and long analysis."
+    );
+  }
+
   return {
     suggestedMove,
     latestUserText,
+    userIntent,
     seriousLifeEvent,
     continueRequested,
     recentQuestionLedReplies,
     instructions
   };
+}
+
+function detectUserIntentFromTranscript(transcript: string): UserIntent {
+  const latest = latestUserLine(transcript);
+
+  if (isContinueSignal(latest)) return "explicit_continue";
+  if (["done", "leave it there", "stop", "that's enough", "thats enough"].includes(normalizeConversationalSignal(latest))) {
+    return "explicit_stop";
+  }
+  if (isCorrectionSignal(latest)) return "correction";
+  if (isAcknowledgement(latest)) return "acknowledgement";
+  return "substantive_response";
+}
+
+function isUserIntent(value: unknown): value is UserIntent {
+  return (
+    value === "substantive_response" ||
+    value === "acknowledgement" ||
+    value === "polite_close" ||
+    value === "explicit_continue" ||
+    value === "correction" ||
+    value === "explicit_stop"
+  );
 }
 
 function latestUserLine(transcript: string) {
@@ -220,6 +279,48 @@ function countRecentQuestionLedClaraReplies(transcript: string) {
 
 function isContinueSignal(text: string) {
   return ["keep going", "continue", "say more", "go deeper"].includes(text.trim().toLowerCase());
+}
+
+function isAcknowledgement(text: string) {
+  return [
+    "thanks",
+    "thank you",
+    "thx",
+    "okay",
+    "ok",
+    "got it",
+    "makes sense",
+    "yep",
+    "yeah",
+    "cool",
+    "sounds good"
+  ].includes(normalizeConversationalSignal(text));
+}
+
+function isCorrectionSignal(text: string) {
+  const lower = text.toLowerCase().trim();
+  return (
+    /\bi didn'?t mean\b/.test(lower) ||
+    /\bi didnt mean\b/.test(lower) ||
+    /\bi didn'?t say\b/.test(lower) ||
+    /\bthat's not what i meant\b/.test(lower) ||
+    /\bthats not what i meant\b/.test(lower) ||
+    /\bthat's not what i said\b/.test(lower) ||
+    /\bthats not what i said\b/.test(lower) ||
+    /\bnot exactly\b/.test(lower) ||
+    /\bi mean\b/.test(lower) ||
+    /^no[, ]/.test(lower) ||
+    /\bno,? actually\b/.test(lower) ||
+    /\bactually\b/.test(lower)
+  );
+}
+
+function normalizeConversationalSignal(text: string) {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[.!?]+$/g, "")
+    .replace(/\s+/g, " ");
 }
 
 function isSeriousLifeEvent(text: string) {
