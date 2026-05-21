@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type Depth = "Light" | "Thoughtful" | "Deep";
 type EngineDepth = "light" | "thoughtful" | "deep";
-type Tab = "Today" | "Moments" | "History" | "Recap" | "Settings";
+type Tab = "Today" | "Moments" | "Meaning" | "History" | "Recap" | "Settings";
 type LengthBucket = "short" | "medium" | "long";
 type Sentiment = "positive" | "neutral" | "negative";
 type MessageRole = "clara" | "user";
@@ -20,6 +20,8 @@ type TouchpointType =
   | "before_event"
   | "after_event";
 type MomentKind = "Before something" | "After something" | "Just noticed something";
+type MeaningNoteConfidence = "low" | "medium" | "high";
+type MeaningNoteMode = "review" | "edit";
 type ResponseStrategy =
   | "acknowledge"
   | "reflect"
@@ -88,6 +90,19 @@ type CompletedSession = CurrentSession & {
   summary: string;
 };
 
+type MeaningNote = {
+  id: string;
+  createdAt: string;
+  sourceSessionId: string;
+  sourceStartedAt: string;
+  sourceTouchpointType: TouchpointType;
+  sourceLabel: string;
+  meaningNote: string;
+  lenses: string[];
+  themes: string[];
+  confidence: MeaningNoteConfidence;
+};
+
 type LegacyEntry = {
   id: string;
   createdAt: string;
@@ -137,6 +152,15 @@ type ClaraLabResponse = {
   fallbackUsed?: boolean;
 };
 
+type MeaningNoteResponse = {
+  meaningNote?: string;
+  lenses?: string[];
+  themes?: string[];
+  confidence?: MeaningNoteConfidence;
+  error?: string;
+  detail?: string;
+};
+
 type ResponseIntent = {
   intent: ResponseIntentName;
   strategy: ResponseStrategy | ResponseIntentName;
@@ -167,7 +191,8 @@ const STORAGE_KEYS = {
   profile: "whyld-world-clara-profile",
   currentSession: "whyld-world-clara-current-session",
   sessions: "whyld-world-clara-sessions",
-  legacyEntries: "whyld-world-clara-entries"
+  legacyEntries: "whyld-world-clara-entries",
+  meaningNotes: "whyld-world-clara-meaning-notes"
 };
 
 const APP_STORAGE_PREFIXES = ["whyld-world-", "whyld-", "clara-"];
@@ -1470,6 +1495,85 @@ function fallbackWeeklyMeaningThread(records: CompletedSession[]) {
   ].join("\n");
 }
 
+function weeklyMeaningNotesTranscript(notes: MeaningNote[]) {
+  const lines = notes
+    .slice(0, 12)
+    .map((note) => {
+      const lenses = note.lenses.length > 0 ? ` lenses: ${note.lenses.join(", ")};` : "";
+      const themes = note.themes.length > 0 ? ` themes: ${note.themes.join(", ")};` : "";
+
+      return `- ${formatDate(note.createdAt)} [${note.sourceLabel};${lenses}${themes}] ${note.meaningNote}`;
+    })
+    .join("\n");
+
+  return `User: Please review these saved Meaning Notes from this week.\n${lines}`;
+}
+
+function fallbackWeeklyMeaningFromNotes(notes: MeaningNote[]) {
+  const first = notes[0];
+  const repeatedLens = mostCommon(notes.flatMap((note) => note.lenses));
+  const repeatedTheme = mostCommon(notes.flatMap((note) => note.themes));
+  const anchor = repeatedLens || repeatedTheme || "what keeps asking for attention";
+
+  return first
+    ? `This week, ${first.sourceLabel.toLowerCase()} and ${anchor} seem to point toward one larger thread: ${first.meaningNote}\n\nDoes that feel true?`
+    : "There is not quite enough saved meaning yet. Does that feel true?";
+}
+
+function meaningNoteFromResponse(session: CompletedSession, response: MeaningNoteResponse): MeaningNote {
+  return {
+    id: crypto.randomUUID(),
+    createdAt: new Date().toISOString(),
+    sourceSessionId: session.sessionId,
+    sourceStartedAt: session.startedAt,
+    sourceTouchpointType: session.touchpointType ?? "daily_check_in",
+    sourceLabel: sessionDisplayLabel(session),
+    meaningNote: response.meaningNote?.trim() || fallbackMeaningNoteText(session),
+    lenses: cleanStringList(response.lenses).slice(0, 4),
+    themes: cleanStringList(response.themes).slice(0, 5),
+    confidence: response.confidence ?? "medium"
+  };
+}
+
+function fallbackMeaningNoteForSession(session: CompletedSession): MeaningNote {
+  const tags = sessionTags(session);
+
+  return {
+    id: crypto.randomUUID(),
+    createdAt: new Date().toISOString(),
+    sourceSessionId: session.sessionId,
+    sourceStartedAt: session.startedAt,
+    sourceTouchpointType: session.touchpointType ?? "daily_check_in",
+    sourceLabel: sessionDisplayLabel(session),
+    meaningNote: fallbackMeaningNoteText(session),
+    lenses: tags.slice(0, 3),
+    themes: tags.slice(0, 4),
+    confidence: "low"
+  };
+}
+
+function fallbackMeaningNoteText(session: CompletedSession) {
+  const text = session.summary || sessionText(session) || "this moment";
+  const label = sessionDisplayLabel(session).toLowerCase();
+
+  return `${text} seems to be something worth remembering from this ${label}.`;
+}
+
+function cleanStringList(value: unknown) {
+  return Array.isArray(value)
+    ? Array.from(new Set(value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean)))
+    : [];
+}
+
+function mostCommon(values: string[]) {
+  const counts = values.reduce<Record<string, number>>((current, value) => {
+    current[value] = (current[value] ?? 0) + 1;
+    return current;
+  }, {});
+
+  return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
+}
+
 function isToday(value: string) {
   return new Date(value).toDateString() === new Date().toDateString();
 }
@@ -1486,7 +1590,7 @@ function engineToDepth(depth: EngineDepth): Depth {
 
 function sessionText(session: CurrentSession) {
   return session.messages
-    .filter((message) => message.role === "user")
+    .filter((message) => message.role === "user" && !isMomentKind(message.text))
     .map((message) => message.text)
     .join(" ");
 }
@@ -1648,6 +1752,24 @@ function isCompletedSession(value: unknown): value is CompletedSession {
   return typeof completed.endedAt === "string" && typeof completed.summary === "string" && Array.isArray(completed.tags);
 }
 
+function isMeaningNote(value: unknown): value is MeaningNote {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.createdAt === "string" &&
+    typeof value.sourceSessionId === "string" &&
+    typeof value.sourceStartedAt === "string" &&
+    isTouchpointType(value.sourceTouchpointType) &&
+    typeof value.sourceLabel === "string" &&
+    typeof value.meaningNote === "string" &&
+    Array.isArray(value.lenses) &&
+    value.lenses.every((item) => typeof item === "string") &&
+    Array.isArray(value.themes) &&
+    value.themes.every((item) => typeof item === "string") &&
+    (value.confidence === "low" || value.confidence === "medium" || value.confidence === "high")
+  );
+}
+
 function normalizeSession(session: CurrentSession): CurrentSession {
   return {
     ...session,
@@ -1743,6 +1865,21 @@ function readCurrentSessionFromStorage(): CurrentSession | null {
   return null;
 }
 
+function readMeaningNotesFromStorage(): MeaningNote[] {
+  const storedNotes = window.localStorage.getItem(STORAGE_KEYS.meaningNotes);
+  const parsedNotes = parseStoredJson<unknown>(storedNotes);
+
+  if (Array.isArray(parsedNotes)) {
+    return parsedNotes.filter(isMeaningNote);
+  }
+
+  if (storedNotes) {
+    window.localStorage.removeItem(STORAGE_KEYS.meaningNotes);
+  }
+
+  return [];
+}
+
 function clearPrototypeStorage() {
   Object.values(STORAGE_KEYS).forEach((key) => window.localStorage.removeItem(key));
 
@@ -1795,17 +1932,25 @@ export default function Home() {
   const [draftProfile, setDraftProfile] = useState<Profile>(starterProfile);
   const [currentSession, setCurrentSession] = useState<CurrentSession | null>(null);
   const [sessions, setSessions] = useState<CompletedSession[]>([]);
+  const [meaningNotes, setMeaningNotes] = useState<MeaningNote[]>([]);
+  const [pendingMeaningNote, setPendingMeaningNote] = useState<MeaningNote | null>(null);
+  const [meaningNoteDraftText, setMeaningNoteDraftText] = useState("");
+  const [meaningNoteMode, setMeaningNoteMode] = useState<MeaningNoteMode>("review");
+  const [meaningNoteLoading, setMeaningNoteLoading] = useState(false);
+  const [meaningNoteError, setMeaningNoteError] = useState("");
   const [answer, setAnswer] = useState("");
   const [tab, setTab] = useState<Tab>("Today");
   const [closingMessage, setClosingMessage] = useState("");
   const [weeklyMeaning, setWeeklyMeaning] = useState("");
   const [weeklyMeaningLoading, setWeeklyMeaningLoading] = useState(false);
   const [weeklyMeaningError, setWeeklyMeaningError] = useState("");
+  const [weeklyMeaningFeedback, setWeeklyMeaningFeedback] = useState("");
 
   useEffect(() => {
     const parsedProfile = readProfileFromStorage();
     const parsedSessions = readSessionsFromStorage();
     const parsedSession = readCurrentSessionFromStorage();
+    const parsedMeaningNotes = readMeaningNotesFromStorage();
 
     if (parsedProfile) {
       setProfile(parsedProfile);
@@ -1813,6 +1958,7 @@ export default function Home() {
     }
 
     setSessions(parsedSessions);
+    setMeaningNotes(parsedMeaningNotes);
 
     if (parsedSession) {
       if (parsedSession.status === "active" && isToday(parsedSession.startedAt)) {
@@ -1832,6 +1978,12 @@ export default function Home() {
       window.localStorage.setItem(STORAGE_KEYS.sessions, JSON.stringify(sessions));
     }
   }, [sessions, ready]);
+
+  useEffect(() => {
+    if (ready) {
+      window.localStorage.setItem(STORAGE_KEYS.meaningNotes, JSON.stringify(meaningNotes));
+    }
+  }, [meaningNotes, ready]);
 
   useEffect(() => {
     if (!ready) return;
@@ -2195,6 +2347,71 @@ export default function Home() {
     setAnswer("");
     setClosingMessage(finalClaraText);
     window.localStorage.removeItem(STORAGE_KEYS.currentSession);
+    void generateMeaningNoteForSession(closedSession);
+  }
+
+  async function generateMeaningNoteForSession(session: CompletedSession) {
+    setMeaningNoteLoading(true);
+    setMeaningNoteError("");
+    setPendingMeaningNote(null);
+    setMeaningNoteDraftText("");
+    setMeaningNoteMode("review");
+
+    try {
+      const response = await fetch("/api/meaning-note", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          transcript: sessionTranscript(session, 20),
+          opener: sessionOpener(session),
+          touchpointType: session.touchpointType ?? "daily_check_in",
+          memory: profileMemory(profile, sessions),
+          sourceLabel: sessionDisplayLabel(session)
+        })
+      });
+      const data = (await response.json()) as MeaningNoteResponse;
+
+      if (!response.ok || !data.meaningNote) {
+        throw new Error(data.detail || data.error || `Meaning Note failed with ${response.status}`);
+      }
+
+      const note = meaningNoteFromResponse(session, data);
+      setPendingMeaningNote(note);
+      setMeaningNoteDraftText(note.meaningNote);
+    } catch (error) {
+      console.warn("Using fallback Meaning Note", error);
+      const note = fallbackMeaningNoteForSession(session);
+      setPendingMeaningNote(note);
+      setMeaningNoteDraftText(note.meaningNote);
+      setMeaningNoteError("Using a local Meaning Note because Clara's extraction route was unavailable.");
+    } finally {
+      setMeaningNoteLoading(false);
+    }
+  }
+
+  function savePendingMeaningNote() {
+    if (!pendingMeaningNote) return;
+
+    const noteToSave: MeaningNote = {
+      ...pendingMeaningNote,
+      meaningNote: meaningNoteDraftText.trim() || pendingMeaningNote.meaningNote
+    };
+
+    setMeaningNotes((current) => [noteToSave, ...current.filter((note) => note.id !== noteToSave.id)]);
+    setPendingMeaningNote(null);
+    setMeaningNoteDraftText("");
+    setMeaningNoteMode("review");
+    setMeaningNoteError("");
+    setTab("Meaning");
+  }
+
+  function discardPendingMeaningNote() {
+    setPendingMeaningNote(null);
+    setMeaningNoteDraftText("");
+    setMeaningNoteMode("review");
+    setMeaningNoteError("");
   }
 
   function updateDepth(depth: Depth) {
@@ -2242,11 +2459,12 @@ export default function Home() {
   }
 
   async function generateWeeklyMeaningThread() {
-    if (weeklySessions.length === 0) return;
+    if (weeklyMeaningNotes.length === 0) return;
 
     setWeeklyMeaningLoading(true);
     setWeeklyMeaningError("");
     setWeeklyMeaning("");
+    setWeeklyMeaningFeedback("");
 
     try {
       const response = await fetch("/api/clara-lab", {
@@ -2256,11 +2474,11 @@ export default function Home() {
         },
         body: JSON.stringify({
           task:
-            "Review these saved Clara check-ins and lightweight moments. Return exactly three concise lines: Observed pattern, Meaning thread, Question. Use plain human language and do not mention tags.",
+            "Review these saved Meaning Notes. Generate one plain-language weekly thread in 1-2 sentences, then ask exactly: Does that feel true?",
           opener: "Weekly Meaning Thread",
           memory: profileMemory(profile, sessions),
           depth: profile ? depthToEngine(profile.depth) : "thoughtful",
-          transcript: weeklyMeaningTranscript(weeklySessions)
+          transcript: weeklyMeaningNotesTranscript(weeklyMeaningNotes)
         })
       });
       const data = (await response.json()) as ClaraLabResponse;
@@ -2272,7 +2490,7 @@ export default function Home() {
       setWeeklyMeaning(data.text);
     } catch (error) {
       console.warn("Using fallback weekly meaning thread", error);
-      setWeeklyMeaning(fallbackWeeklyMeaningThread(weeklySessions));
+      setWeeklyMeaning(fallbackWeeklyMeaningFromNotes(weeklyMeaningNotes));
       setWeeklyMeaningError("Using a local recap because Clara's response route was unavailable.");
     } finally {
       setWeeklyMeaningLoading(false);
@@ -2294,6 +2512,10 @@ export default function Home() {
     const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
     return sessions.filter((session) => new Date(session.startedAt).getTime() >= sevenDaysAgo);
   }, [sessions]);
+  const weeklyMeaningNotes = useMemo(() => {
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    return meaningNotes.filter((note) => new Date(note.createdAt).getTime() >= sevenDaysAgo);
+  }, [meaningNotes]);
 
   const weeklyCounts = useMemo(() => sessionTagCounts(weeklySessions), [weeklySessions]);
   const topTags = useMemo(
@@ -2303,6 +2525,18 @@ export default function Home() {
         .slice(0, 3),
     [weeklyCounts]
   );
+  const topMeaningThemes = useMemo(() => {
+    const counts = weeklyMeaningNotes
+      .flatMap((note) => note.themes)
+      .reduce<Record<string, number>>((current, theme) => {
+        current[theme] = (current[theme] ?? 0) + 1;
+        return current;
+      }, {});
+
+    return Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3);
+  }, [weeklyMeaningNotes]);
   const latestClaraMessage = [...(currentSession?.messages ?? [])].reverse().find((message) => message.role === "clara");
   const latestExpectedInput = latestClaraMessage?.expectedInput ?? "none";
   const latestChoices = latestClaraMessage?.choices ?? [];
@@ -2453,6 +2687,52 @@ export default function Home() {
               <p className="text-2xl leading-9 text-pearl">
                 {closingMessage || "Saved for today. I'll keep an eye on what keeps showing up."}
               </p>
+              {meaningNoteLoading ? (
+                <section className="space-y-2 rounded-md border border-pearl/10 bg-pearl/7 p-4">
+                  <p className="text-sm text-clay">Meaning Note</p>
+                  <p className="text-lg leading-7 text-fog">Clara is turning this into a small note for your map.</p>
+                </section>
+              ) : null}
+              {pendingMeaningNote ? (
+                <section className="space-y-4 rounded-md border border-pearl/10 bg-pearl/7 p-4">
+                  <div className="space-y-2">
+                    <p className="text-sm text-clay">Meaning Note</p>
+                    {meaningNoteError ? <p className="text-sm leading-6 text-clay">{meaningNoteError}</p> : null}
+                    {meaningNoteMode === "edit" ? (
+                      <textarea
+                        className="min-h-32 w-full resize-none rounded-md border border-pearl/12 bg-ink/55 px-4 py-3 text-lg leading-7 text-pearl outline-none transition focus:border-clay/70"
+                        value={meaningNoteDraftText}
+                        onChange={(event) => setMeaningNoteDraftText(event.target.value)}
+                      />
+                    ) : (
+                      <p className="text-xl leading-8 text-pearl">{pendingMeaningNote.meaningNote}</p>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      className="rounded-md bg-clay px-4 py-3 text-sm font-medium text-ink transition hover:bg-[#cc9978]"
+                      onClick={savePendingMeaningNote}
+                      type="button"
+                    >
+                      Save
+                    </button>
+                    <button
+                      className="rounded-md border border-pearl/12 bg-pearl/7 px-4 py-3 text-sm text-fog transition hover:bg-pearl/10"
+                      onClick={() => setMeaningNoteMode(meaningNoteMode === "edit" ? "review" : "edit")}
+                      type="button"
+                    >
+                      {meaningNoteMode === "edit" ? "Review" : "Edit"}
+                    </button>
+                    <button
+                      className="rounded-md border border-pearl/12 bg-pearl/7 px-4 py-3 text-sm text-fog transition hover:bg-pearl/10"
+                      onClick={discardPendingMeaningNote}
+                      type="button"
+                    >
+                      Not quite
+                    </button>
+                  </div>
+                </section>
+              ) : null}
               <button
                 className="w-full rounded-md border border-pearl/12 bg-pearl/7 px-5 py-4 text-base text-fog transition hover:bg-pearl/10"
                 onClick={startNewSession}
@@ -2516,6 +2796,17 @@ export default function Home() {
         </section>
       )}
 
+      {tab === "Meaning" && (
+        <section className="space-y-5">
+          <ViewTitle eyebrow="Meaning Map" title="What your moments are becoming." />
+          {meaningNotes.length === 0 ? (
+            <EmptyState text="Saved Meaning Notes will gather here after you finish a check-in or moment." />
+          ) : (
+            meaningNotes.map((note) => <MeaningNoteCard note={note} key={note.id} />)
+          )}
+        </section>
+      )}
+
       {tab === "History" && (
         <section className="space-y-5">
           <ViewTitle eyebrow="Past sessions" title="What Clara has held with you." />
@@ -2530,8 +2821,8 @@ export default function Home() {
       {tab === "Recap" && (
         <section className="space-y-6">
           <ViewTitle eyebrow="Weekly Meaning Thread" title="What keeps showing up." />
-          {weeklySessions.length === 0 ? (
-            <EmptyState text="A meaning thread appears after you complete at least one check-in or moment this week." />
+          {weeklyMeaningNotes.length === 0 ? (
+            <EmptyState text="A meaning thread appears after you save at least one Meaning Note this week." />
           ) : (
             <>
               <section className="space-y-3 border-t border-pearl/10 pt-6">
@@ -2554,17 +2845,41 @@ export default function Home() {
                 <section className="space-y-3 border-t border-pearl/10 pt-6">
                   <p className="text-sm text-clay">Clara noticed</p>
                   <p className="whitespace-pre-wrap text-2xl leading-9 text-pearl">{weeklyMeaning}</p>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      className="rounded-md bg-clay px-4 py-3 text-sm font-medium text-ink transition hover:bg-[#cc9978]"
+                      onClick={() => setWeeklyMeaningFeedback("Marked as true enough for now.")}
+                      type="button"
+                    >
+                      Yes
+                    </button>
+                    <button
+                      className="rounded-md border border-pearl/12 bg-pearl/7 px-4 py-3 text-sm text-fog transition hover:bg-pearl/10"
+                      onClick={() => setWeeklyMeaningFeedback("Got it. Clara will hold that thread lightly.")}
+                      type="button"
+                    >
+                      Not quite
+                    </button>
+                    <button
+                      className="rounded-md border border-pearl/12 bg-pearl/7 px-4 py-3 text-sm text-fog transition hover:bg-pearl/10"
+                      onClick={() => setWeeklyMeaningFeedback("Try opening one note in the Map and adding one more moment around it.")}
+                      type="button"
+                    >
+                      Tell me more
+                    </button>
+                  </div>
+                  {weeklyMeaningFeedback ? <p className="text-base leading-7 text-fog">{weeklyMeaningFeedback}</p> : null}
                 </section>
               ) : null}
 
-              {topTags.length > 0 ? (
+              {topMeaningThemes.length > 0 ? (
                 <section className="space-y-3 border-t border-pearl/10 pt-6">
-                  <p className="text-sm text-clay">Local signals</p>
-                  {topTags.map(([tag, count]) => (
-                    <div className="flex items-center justify-between border-b border-pearl/10 py-3" key={tag}>
-                      <span className="text-xl text-pearl">{capitalize(tag)}</span>
+                  <p className="text-sm text-clay">Saved note themes</p>
+                  {topMeaningThemes.map(([theme, count]) => (
+                    <div className="flex items-center justify-between border-b border-pearl/10 py-3" key={theme}>
+                      <span className="text-xl text-pearl">{capitalize(theme)}</span>
                       <span className="text-sm text-fog">
-                        {count} {count === 1 ? "moment" : "moments"}
+                        {count} {count === 1 ? "note" : "notes"}
                       </span>
                     </div>
                   ))}
@@ -2616,19 +2931,19 @@ export default function Home() {
       )}
 
       <nav className="fixed inset-x-0 bottom-0 border-t border-pearl/10 bg-ink/92 px-3 pb-[calc(1rem+env(safe-area-inset-bottom))] pt-3 backdrop-blur">
-        <div className="mx-auto grid max-w-md grid-cols-5 gap-1">
-          {(["Today", "Moments", "History", "Recap"] as Tab[]).map((item) => (
+        <div className="mx-auto grid max-w-md grid-cols-6 gap-1">
+          {(["Today", "Moments", "Meaning", "History", "Recap"] as Tab[]).map((item) => (
             <button
-              className={`rounded-md px-2 py-3 text-sm transition ${
+              className={`rounded-md px-1 py-3 text-xs transition ${
                 tab === item ? "bg-pearl text-ink" : "text-fog hover:bg-pearl/8"
               }`}
               key={item}
               onClick={() => setTab(item)}
             >
-              {item}
+              {item === "Meaning" ? "Map" : item}
             </button>
           ))}
-          <a className="rounded-md px-2 py-3 text-center text-sm text-fog transition hover:bg-pearl/8" href="/lab">
+          <a className="rounded-md px-1 py-3 text-center text-xs text-fog transition hover:bg-pearl/8" href="/lab">
             Lab
           </a>
         </div>
@@ -2730,12 +3045,41 @@ function HistorySession({ session }: { session: CompletedSession }) {
   );
 }
 
+function MeaningNoteCard({ note }: { note: MeaningNote }) {
+  return (
+    <article className="space-y-4 border-t border-pearl/10 pt-5">
+      <div className="flex items-center justify-between gap-4 text-sm text-fog">
+        <span>{formatDate(note.createdAt)}</span>
+        <span>{note.confidence}</span>
+      </div>
+      <p className="text-sm uppercase tracking-[0.18em] text-clay">{note.sourceLabel}</p>
+      <p className="text-xl leading-8 text-pearl">{note.meaningNote}</p>
+      {note.lenses.length > 0 ? (
+        <div className="space-y-2">
+          <p className="text-sm text-clay">Lenses</p>
+          <TagList values={note.lenses} />
+        </div>
+      ) : null}
+      {note.themes.length > 0 ? (
+        <div className="space-y-2">
+          <p className="text-sm text-clay">Themes</p>
+          <TagList values={note.themes} />
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
 function TagRow({ tags }: { tags: ThemeTag[] }) {
+  return <TagList values={tags} />;
+}
+
+function TagList({ values }: { values: string[] }) {
   return (
     <div className="flex flex-wrap gap-2">
-      {tags.map((tag) => (
-        <span className="rounded-md bg-pearl/8 px-3 py-2 text-sm text-fog" key={tag}>
-          {tag}
+      {values.map((value) => (
+        <span className="rounded-md bg-pearl/8 px-3 py-2 text-sm text-fog" key={value}>
+          {value}
         </span>
       ))}
     </div>
