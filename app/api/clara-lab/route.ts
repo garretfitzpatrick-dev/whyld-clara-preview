@@ -7,6 +7,7 @@ import {
 } from "../../../lib/claraSystemPrompt";
 
 type LabRequest = {
+  task?: string;
   transcript?: string;
   opener?: string;
   memory?: string;
@@ -24,6 +25,9 @@ export async function POST(request: Request) {
   }
 
   const body = (await request.json()) as LabRequest;
+  const task =
+    body.task?.trim() ??
+    "Write Clara's next response. Do not run extraction. Read the transcript for meaning and respond as Clara.";
   const transcript = body.transcript?.trim() ?? "";
   const opener = body.opener?.trim() ?? "";
   const memory = body.memory?.trim() ?? "";
@@ -32,7 +36,7 @@ export async function POST(request: Request) {
   const temperature = clampNumber(body.temperature, 0, 2, CLARA_DEFAULT_TEMPERATURE);
   const maxTokens = Math.round(clampNumber(body.maxTokens, 40, 800, CLARA_DEFAULT_MAX_TOKENS));
   const responseGuidance = buildResponseGuidance(transcript);
-  const userPrompt = buildLabUserPrompt({ transcript, opener, memory, depth, responseGuidance });
+  const userPrompt = buildLabUserPrompt({ task, transcript, opener, memory, depth, responseGuidance });
   const debugPrompt = {
     model,
     temperature,
@@ -109,17 +113,18 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
 }
 
 function buildLabUserPrompt({
+  task,
   transcript,
   opener,
   memory,
   depth,
   responseGuidance
-}: Pick<Required<LabRequest>, "transcript" | "opener" | "memory" | "depth"> & {
+}: Pick<Required<LabRequest>, "task" | "transcript" | "opener" | "memory" | "depth"> & {
   responseGuidance: ResponseGuidance;
 }) {
   return JSON.stringify(
     {
-      task: "Write Clara's next response. Do not run extraction. Read the transcript for meaning and respond as Clara.",
+      task,
       opener,
       memory,
       depth,

@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type Depth = "Light" | "Thoughtful" | "Deep";
 type EngineDepth = "light" | "thoughtful" | "deep";
-type Tab = "Today" | "History" | "Recap" | "Settings";
+type Tab = "Today" | "Moments" | "History" | "Recap" | "Settings";
 type LengthBucket = "short" | "medium" | "long";
 type Sentiment = "positive" | "neutral" | "negative";
 type MessageRole = "clara" | "user";
@@ -12,6 +12,14 @@ type SessionStatus = "active" | "closed";
 type ExpectedInput = "choice" | "text" | "none";
 type ThreadSource = "clara" | "user";
 type UserDepthSignal = "low" | "medium" | "high";
+type TouchpointType =
+  | "daily_check_in"
+  | "morning_orientation"
+  | "evening_reflection"
+  | "marked_moment"
+  | "before_event"
+  | "after_event";
+type MomentKind = "Before something" | "After something" | "Just noticed something";
 type ResponseStrategy =
   | "acknowledge"
   | "reflect"
@@ -69,6 +77,9 @@ type CurrentSession = {
   threadCorrectionOffered: boolean;
   turnCount: number;
   userDepthSignal: UserDepthSignal;
+  touchpointType?: TouchpointType;
+  momentKind?: MomentKind;
+  eventType?: string;
 };
 
 type CompletedSession = CurrentSession & {
@@ -167,6 +178,16 @@ const timeAwareOpeners = {
   afternoon: "What's been taking your attention today?",
   evening: "How was your day?",
   night: "Anything from today still with you?"
+};
+
+const morningOrientationPrompt = "What's one thing you want to protect today?";
+const eveningReflectionPrompt = "Anything from today worth remembering?";
+const markMomentPrompt = "What happened?";
+const momentKindChoices: MomentKind[] = ["Before something", "After something", "Just noticed something"];
+const momentKindPrompts: Record<MomentKind, string> = {
+  "Before something": "What are you about to enter?",
+  "After something": "What's still with you from it?",
+  "Just noticed something": "What did you notice?"
 };
 
 const tagLexicon: Record<ThemeTag, string[]> = {
@@ -396,14 +417,23 @@ function makeClaraMessage(turn: ClaraTurn): ClaraMessage {
   };
 }
 
-function createSession(depth: EngineDepth): CurrentSession {
+function createSession(
+  depth: EngineDepth,
+  options: {
+    opener?: string;
+    touchpointType?: TouchpointType;
+    momentKind?: MomentKind;
+    choices?: string[];
+  } = {}
+): CurrentSession {
   return {
     sessionId: crypto.randomUUID(),
     startedAt: new Date().toISOString(),
     messages: [
       makeClaraMessage({
-        text: todayOpener(),
-        expectedInput: "text"
+        text: options.opener ?? todayOpener(),
+        expectedInput: "text",
+        choices: options.choices
       })
     ],
     currentDepth: depth,
@@ -414,7 +444,9 @@ function createSession(depth: EngineDepth): CurrentSession {
     awaitingThreadRedirect: false,
     threadCorrectionOffered: false,
     turnCount: 0,
-    userDepthSignal: "low"
+    userDepthSignal: "low",
+    touchpointType: options.touchpointType ?? "daily_check_in",
+    momentKind: options.momentKind
   };
 }
 
@@ -1204,7 +1236,7 @@ async function generateClaraFromConversation(
 ): Promise<ClaraTextResult> {
   const transcript = sessionTranscript(session, 10);
   const opener = sessionOpener(session);
-  const memory = profileMemory(profile, previousSessions);
+  const memory = [profileMemory(profile, previousSessions), sessionTouchpointContext(session)].filter(Boolean).join("\n");
 
   try {
     console.log("Calling Clara lab-style route", { opener, transcript, memory, depth: session.currentDepth });
@@ -1401,6 +1433,43 @@ function formatDate(value: string) {
   }).format(new Date(value));
 }
 
+function sessionDisplayLabel(session: Pick<CurrentSession, "touchpointType" | "momentKind" | "eventType">) {
+  if (session.touchpointType === "morning_orientation") return "Morning Orientation";
+  if (session.touchpointType === "evening_reflection") return "Evening Reflection";
+  if (session.touchpointType === "marked_moment") return session.momentKind ?? "Marked Moment";
+  if (session.touchpointType === "before_event") return `Before ${session.eventType ?? "Event"}`;
+  if (session.touchpointType === "after_event") return `After ${session.eventType ?? "Event"}`;
+  return "Daily check-in";
+}
+
+function weeklyMeaningTranscript(records: CompletedSession[]) {
+  const lines = records
+    .slice(0, 10)
+    .map((session) => {
+      const date = formatDate(session.startedAt);
+      const label = sessionDisplayLabel(session);
+      const context = session.momentKind ? `, context: ${session.momentKind}` : "";
+      const userText = sessionText(session) || session.summary;
+
+      return `- ${date} [${label}${context}]: ${userText}`;
+    })
+    .join("\n");
+
+  return `User: Please review these saved check-ins and lightweight moments from this week.\n${lines}`;
+}
+
+function fallbackWeeklyMeaningThread(records: CompletedSession[]) {
+  const summaries = records.map((session) => session.summary).filter(Boolean);
+  const label = records.find((session) => session.touchpointType && session.touchpointType !== "daily_check_in");
+  const anchor = summaries[0] ?? "your recent check-ins";
+
+  return [
+    `Observed pattern: ${label ? sessionDisplayLabel(label) : "Your check-ins"} kept showing up this week.`,
+    `Meaning thread: ${anchor}`,
+    "Question: What feels worth protecting from that next week?"
+  ].join("\n");
+}
+
 function isToday(value: string) {
   return new Date(value).toDateString() === new Date().toDateString();
 }
@@ -1450,6 +1519,17 @@ function profileMemory(profile: Profile | null, sessions: CompletedSession[]) {
   return lines.join("\n");
 }
 
+function sessionTouchpointContext(session: CurrentSession) {
+  const lines: string[] = [];
+  lines.push(`Current touchpoint type: ${session.touchpointType ?? "daily_check_in"}`);
+
+  if (session.momentKind) {
+    lines.push(`Moment context: ${session.momentKind}`);
+  }
+
+  return lines.join("\n");
+}
+
 function sessionTags(session: CurrentSession): ThemeTag[] {
   return Array.from(new Set(inferTags(sessionText(session))));
 }
@@ -1457,6 +1537,16 @@ function sessionTags(session: CurrentSession): ThemeTag[] {
 function sessionOpenerFrame(session: CurrentSession) {
   const opener = session.messages.find((message) => message.role === "clara")?.text.toLowerCase() ?? "";
 
+  if (opener.includes("protect today") || opener.includes("show up today") || opener.includes("attention today")) {
+    return "orientation";
+  }
+  if (opener.includes("worth remembering")) return "evening_reflection";
+  if (opener.includes("what happened")) return "marked_moment";
+  if (opener.includes("about to enter")) return "before_something";
+  if (opener.includes("still with you")) return "after_something";
+  if (opener.includes("what did you notice")) return "just_noticed";
+  if (opener.includes("get out of this")) return "before_event";
+  if (opener.includes("actually happened")) return "after_event";
   if (opener.includes("gave you energy")) return "energy";
   if (opener.includes("took energy")) return "drain";
   if (opener.includes("actually mattered")) return "mattering";
@@ -1475,7 +1565,9 @@ function sessionTagCounts(sessions: CompletedSession[]) {
 }
 
 function summarizeSession(session: CurrentSession) {
-  const firstUserMessage = session.messages.find((message) => message.role === "user")?.text;
+  const firstUserMessage = session.messages.find(
+    (message) => message.role === "user" && !isMomentKind(message.text)
+  )?.text;
   return firstUserMessage ?? "A quiet check-in.";
 }
 
@@ -1503,6 +1595,21 @@ function isSessionStatus(value: unknown): value is SessionStatus {
 
 function isExpectedInput(value: unknown): value is ExpectedInput {
   return value === "choice" || value === "text" || value === "none";
+}
+
+function isTouchpointType(value: unknown): value is TouchpointType {
+  return (
+    value === "daily_check_in" ||
+    value === "morning_orientation" ||
+    value === "evening_reflection" ||
+    value === "marked_moment" ||
+    value === "before_event" ||
+    value === "after_event"
+  );
+}
+
+function isMomentKind(value: unknown): value is MomentKind {
+  return value === "Before something" || value === "After something" || value === "Just noticed something";
 }
 
 function isConversationMessage(value: unknown): value is ConversationMessage {
@@ -1564,6 +1671,16 @@ function normalizeSession(session: CurrentSession): CurrentSession {
       (session as CurrentSession & { userDepthSignal?: unknown }).userDepthSignal === "high"
         ? ((session as CurrentSession & { userDepthSignal: UserDepthSignal }).userDepthSignal)
         : "low",
+    touchpointType: isTouchpointType((session as CurrentSession & { touchpointType?: unknown }).touchpointType)
+      ? (session as CurrentSession & { touchpointType: TouchpointType }).touchpointType
+      : "daily_check_in",
+    momentKind: isMomentKind((session as CurrentSession & { momentKind?: unknown }).momentKind)
+      ? (session as CurrentSession & { momentKind: MomentKind }).momentKind
+      : undefined,
+    eventType:
+      typeof (session as CurrentSession & { eventType?: unknown }).eventType === "string"
+        ? (session as CurrentSession & { eventType: string }).eventType
+        : undefined,
     messages: session.messages.map((message, index) => {
       if (message.role === "user") return message;
 
@@ -1648,6 +1765,7 @@ function legacyEntriesToSessions(entries: LegacyEntry[]): CompletedSession[] {
     threadCorrectionOffered: false,
     turnCount: 1,
     userDepthSignal: inferUserDepthSignal(entry.response),
+    touchpointType: "daily_check_in",
     tags: entry.tags,
     summary: entry.response,
     messages: [
@@ -1680,6 +1798,9 @@ export default function Home() {
   const [answer, setAnswer] = useState("");
   const [tab, setTab] = useState<Tab>("Today");
   const [closingMessage, setClosingMessage] = useState("");
+  const [weeklyMeaning, setWeeklyMeaning] = useState("");
+  const [weeklyMeaningLoading, setWeeklyMeaningLoading] = useState(false);
+  const [weeklyMeaningError, setWeeklyMeaningError] = useState("");
 
   useEffect(() => {
     const parsedProfile = readProfileFromStorage();
@@ -1740,6 +1861,28 @@ export default function Home() {
     if (!trimmed || !currentSession) return;
     const latestClara = [...currentSession.messages].reverse().find((message) => message.role === "clara");
     const isThreadCorrectionChoice = latestClara?.choices?.includes("Something else") ?? false;
+    const chosenMomentKind = isMomentKind(trimmed) ? trimmed : null;
+    const isInitialMomentKindChoice =
+      currentSession.touchpointType === "marked_moment" &&
+      currentSession.messages.filter((message) => message.role === "user").length === 0 &&
+      chosenMomentKind !== null;
+
+    if (isInitialMomentKindChoice && chosenMomentKind) {
+      setCurrentSession({
+        ...currentSession,
+        momentKind: chosenMomentKind,
+        messages: [
+          ...currentSession.messages,
+          makeUserMessage(chosenMomentKind),
+          makeClaraMessage({
+            text: momentKindPrompts[chosenMomentKind],
+            expectedInput: "text"
+          })
+        ]
+      });
+      setAnswer("");
+      return;
+    }
 
     if (isThreadCorrectionChoice && normalizeChoice(trimmed) === "something else") {
       setCurrentSession({
@@ -2075,6 +2218,67 @@ export default function Home() {
     setCurrentSession(createSession(depthToEngine(profile.depth)));
   }
 
+  function startTouchpointSession(
+    touchpointType: TouchpointType,
+    opener: string,
+    options: {
+      momentKind?: MomentKind;
+      choices?: string[];
+    } = {}
+  ) {
+    if (!profile) return;
+
+    setClosingMessage("");
+    setAnswer("");
+    setCurrentSession(
+      createSession(depthToEngine(profile.depth), {
+        opener,
+        touchpointType,
+        momentKind: options.momentKind,
+        choices: options.choices
+      })
+    );
+    setTab("Today");
+  }
+
+  async function generateWeeklyMeaningThread() {
+    if (weeklySessions.length === 0) return;
+
+    setWeeklyMeaningLoading(true);
+    setWeeklyMeaningError("");
+    setWeeklyMeaning("");
+
+    try {
+      const response = await fetch("/api/clara-lab", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          task:
+            "Review these saved Clara check-ins and lightweight moments. Return exactly three concise lines: Observed pattern, Meaning thread, Question. Use plain human language and do not mention tags.",
+          opener: "Weekly Meaning Thread",
+          memory: profileMemory(profile, sessions),
+          depth: profile ? depthToEngine(profile.depth) : "thoughtful",
+          transcript: weeklyMeaningTranscript(weeklySessions)
+        })
+      });
+      const data = (await response.json()) as ClaraLabResponse;
+
+      if (!response.ok || !data.text) {
+        throw new Error(data.detail || data.error || `Weekly recap failed with ${response.status}`);
+      }
+
+      setWeeklyMeaning(data.text);
+    } catch (error) {
+      console.warn("Using fallback weekly meaning thread", error);
+      setWeeklyMeaning(fallbackWeeklyMeaningThread(weeklySessions));
+      setWeeklyMeaningError("Using a local recap because Clara's response route was unavailable.");
+    } finally {
+      setWeeklyMeaningLoading(false);
+    }
+  }
+
   function resetPrototypeData() {
     const confirmed = window.confirm(
       "Reset all Whyld World Clara prototype data on this device? This clears onboarding, sessions, history, and settings."
@@ -2101,7 +2305,11 @@ export default function Home() {
   );
   const latestClaraMessage = [...(currentSession?.messages ?? [])].reverse().find((message) => message.role === "clara");
   const latestExpectedInput = latestClaraMessage?.expectedInput ?? "none";
-  const latestChoices = latestExpectedInput === "choice" ? (latestClaraMessage?.choices ?? []) : [];
+  const latestChoices = latestClaraMessage?.choices ?? [];
+  const requiredChoices = latestExpectedInput === "choice" ? latestChoices : [];
+  const optionalTextChoices = latestExpectedInput === "text" ? latestChoices : [];
+  const currentSessionLabel = currentSession ? sessionDisplayLabel(currentSession) : "Daily check-in";
+  const currentSessionIsTouchpoint = currentSession?.touchpointType && currentSession.touchpointType !== "daily_check_in";
 
   if (!ready) {
     return <main className="min-h-dvh px-5 py-8" />;
@@ -2166,8 +2374,10 @@ export default function Home() {
       {tab === "Today" && (
         <section className="space-y-6">
           <div className="space-y-3">
-            <p className="text-sm text-clay">Today</p>
-            <h2 className="text-4xl leading-tight text-pearl">A check-in with Clara.</h2>
+            <p className="text-sm text-clay">{currentSessionLabel}</p>
+            <h2 className="text-4xl leading-tight text-pearl">
+              {currentSessionIsTouchpoint ? "A moment with Clara." : "A check-in with Clara."}
+            </h2>
           </div>
 
           {currentSession ? (
@@ -2178,9 +2388,9 @@ export default function Home() {
                 ))}
               </section>
 
-              {latestExpectedInput === "choice" && latestChoices.length > 0 && (
+              {latestExpectedInput === "choice" && requiredChoices.length > 0 && (
                 <div className="flex flex-wrap gap-2">
-                  {latestChoices.map((choice) => (
+                  {requiredChoices.map((choice) => (
                     <button
                       className="rounded-md border border-clay/45 bg-clay/15 px-3 py-2 text-sm text-pearl transition hover:bg-clay/25"
                       key={choice}
@@ -2194,6 +2404,20 @@ export default function Home() {
 
               {latestExpectedInput === "text" && (
                 <form className="space-y-4 pb-4" onSubmit={submitReply}>
+                  {optionalTextChoices.length > 0 && (
+                    <div className="flex flex-wrap gap-2">
+                      {optionalTextChoices.map((choice) => (
+                        <button
+                          className="rounded-md border border-pearl/12 bg-pearl/7 px-3 py-2 text-sm text-fog transition hover:bg-pearl/10"
+                          key={choice}
+                          onClick={() => void continueConversation(choice)}
+                          type="button"
+                        >
+                          {choice}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   <textarea
                     className="min-h-36 scroll-mb-40 w-full resize-none rounded-md border border-pearl/12 bg-pearl/7 px-4 py-4 text-xl leading-8 text-pearl outline-none transition placeholder:text-fog/45 focus:border-clay/70"
                     value={answer}
@@ -2240,6 +2464,58 @@ export default function Home() {
         </section>
       )}
 
+      {tab === "Moments" && (
+        <section className="space-y-7">
+          <ViewTitle eyebrow="Lightweight Moments" title="Only what deserves attention." />
+
+          <section className="space-y-4 border-t border-pearl/10 pt-6">
+            <div className="space-y-2">
+              <p className="text-sm uppercase tracking-[0.2em] text-clay">Morning Orientation</p>
+              <p className="text-lg leading-7 text-fog">One small thing to protect before the day gets loud.</p>
+            </div>
+            <button
+              className="w-full rounded-md border border-pearl/12 bg-pearl/7 px-4 py-4 text-left text-lg leading-7 text-pearl transition hover:bg-pearl/10"
+              onClick={() => startTouchpointSession("morning_orientation", morningOrientationPrompt)}
+              type="button"
+            >
+              {morningOrientationPrompt}
+            </button>
+          </section>
+
+          <section className="space-y-4 border-t border-pearl/10 pt-6">
+            <div className="space-y-2">
+              <p className="text-sm uppercase tracking-[0.2em] text-clay">Evening Reflection</p>
+              <p className="text-lg leading-7 text-fog">A quick pass for anything the day already made clear.</p>
+            </div>
+            <button
+              className="w-full rounded-md border border-pearl/12 bg-pearl/7 px-4 py-4 text-left text-lg leading-7 text-pearl transition hover:bg-pearl/10"
+              onClick={() => startTouchpointSession("evening_reflection", eveningReflectionPrompt)}
+              type="button"
+            >
+              {eveningReflectionPrompt}
+            </button>
+          </section>
+
+          <section className="space-y-4 border-t border-pearl/10 pt-6">
+            <div className="space-y-2">
+              <p className="text-sm uppercase tracking-[0.2em] text-clay">Mark Moment</p>
+              <p className="text-lg leading-7 text-fog">Capture the few moments that already have your attention.</p>
+            </div>
+            <button
+              className="w-full rounded-md bg-clay px-5 py-4 text-base font-medium text-ink transition hover:bg-[#cc9978]"
+              onClick={() =>
+                startTouchpointSession("marked_moment", markMomentPrompt, {
+                  choices: momentKindChoices
+                })
+              }
+              type="button"
+            >
+              Mark a moment
+            </button>
+          </section>
+        </section>
+      )}
+
       {tab === "History" && (
         <section className="space-y-5">
           <ViewTitle eyebrow="Past sessions" title="What Clara has held with you." />
@@ -2253,28 +2529,47 @@ export default function Home() {
 
       {tab === "Recap" && (
         <section className="space-y-6">
-          <ViewTitle eyebrow="This week" title="A small pattern map." />
-          {weeklySessions.length === 0 || topTags.length === 0 ? (
-            <EmptyState text="A recap appears after you complete at least one check-in this week." />
+          <ViewTitle eyebrow="Weekly Meaning Thread" title="What keeps showing up." />
+          {weeklySessions.length === 0 ? (
+            <EmptyState text="A meaning thread appears after you complete at least one check-in or moment this week." />
           ) : (
             <>
-              <p className="text-2xl leading-9 text-pearl">
-                {topTags.length > 1
-                  ? `${capitalize(topTags[0][0])} and ${topTags[1][0]} have both shown up this week.`
-                  : `${capitalize(topTags[0][0])} has shown up this week.`}
-              </p>
-              <div className="space-y-3">
-                {topTags.map(([tag, count]) => (
-                  <div className="flex items-center justify-between border-b border-pearl/10 py-3" key={tag}>
-                    <span className="text-xl text-pearl">{capitalize(tag)}</span>
-                    <span className="text-sm text-fog">{count} session{count === 1 ? "" : "s"}</span>
-                  </div>
-                ))}
-              </div>
-              <div className="space-y-3 border-t border-pearl/10 pt-6">
-                <p className="text-sm text-clay">A question for later</p>
-                <p className="text-2xl leading-9 text-pearl">{tagQuestions[topTags[0][0]]}</p>
-              </div>
+              <section className="space-y-3 border-t border-pearl/10 pt-6">
+                <p className="text-lg leading-7 text-fog">
+                  Clara will look across this week's saved check-ins and moments for one recurring thread.
+                </p>
+                <button
+                  className="w-full rounded-md bg-clay px-5 py-4 text-base font-medium text-ink transition hover:bg-[#cc9978] disabled:cursor-not-allowed disabled:opacity-60"
+                  disabled={weeklyMeaningLoading}
+                  onClick={() => void generateWeeklyMeaningThread()}
+                  type="button"
+                >
+                  {weeklyMeaningLoading ? "Looking across the week..." : "Generate meaning thread"}
+                </button>
+              </section>
+
+              {weeklyMeaningError ? <p className="text-sm leading-6 text-clay">{weeklyMeaningError}</p> : null}
+
+              {weeklyMeaning ? (
+                <section className="space-y-3 border-t border-pearl/10 pt-6">
+                  <p className="text-sm text-clay">Clara noticed</p>
+                  <p className="whitespace-pre-wrap text-2xl leading-9 text-pearl">{weeklyMeaning}</p>
+                </section>
+              ) : null}
+
+              {topTags.length > 0 ? (
+                <section className="space-y-3 border-t border-pearl/10 pt-6">
+                  <p className="text-sm text-clay">Local signals</p>
+                  {topTags.map(([tag, count]) => (
+                    <div className="flex items-center justify-between border-b border-pearl/10 py-3" key={tag}>
+                      <span className="text-xl text-pearl">{capitalize(tag)}</span>
+                      <span className="text-sm text-fog">
+                        {count} {count === 1 ? "moment" : "moments"}
+                      </span>
+                    </div>
+                  ))}
+                </section>
+              ) : null}
             </>
           )}
         </section>
@@ -2322,7 +2617,7 @@ export default function Home() {
 
       <nav className="fixed inset-x-0 bottom-0 border-t border-pearl/10 bg-ink/92 px-3 pb-[calc(1rem+env(safe-area-inset-bottom))] pt-3 backdrop-blur">
         <div className="mx-auto grid max-w-md grid-cols-5 gap-1">
-          {(["Today", "History", "Recap", "Settings"] as Tab[]).map((item) => (
+          {(["Today", "Moments", "History", "Recap"] as Tab[]).map((item) => (
             <button
               className={`rounded-md px-2 py-3 text-sm transition ${
                 tab === item ? "bg-pearl text-ink" : "text-fog hover:bg-pearl/8"
@@ -2420,6 +2715,7 @@ function HistorySession({ session }: { session: CompletedSession }) {
         <span>{formatDate(session.startedAt)}</span>
         <span>{engineToDepth(session.currentDepth)}</span>
       </div>
+      <p className="text-sm uppercase tracking-[0.18em] text-clay">{sessionDisplayLabel(session)}</p>
       <p className="text-xl leading-8 text-pearl">{session.summary}</p>
       <div className="space-y-3">
         {session.messages.map((message, index) => (
