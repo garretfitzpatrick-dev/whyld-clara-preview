@@ -14,6 +14,7 @@ type LabRequest = {
   depth?: string;
   userIntent?: UserIntent;
   decisionFrame?: DecisionFramePayload;
+  decisionFrameUpdate?: DecisionFrameUpdatePayload;
   model?: string;
   temperature?: number;
   maxTokens?: number;
@@ -22,9 +23,23 @@ type LabRequest = {
 type DecisionFramePayload = {
   question?: string;
   decisionType?: string;
-  options?: string[];
+  status?: string;
+  threads?: string[];
   criteria?: string[];
   tradeoffs?: string[];
+  knowns?: string[];
+  unknowns?: string[];
+  currentFocus?: string | null;
+  nextStep?: string | null;
+};
+
+type DecisionFrameUpdatePayload = {
+  threads?: string[];
+  criteria?: string[];
+  tradeoffs?: string[];
+  knowns?: string[];
+  unknowns?: string[];
+  currentFocus?: string | null;
   nextStep?: string | null;
 };
 
@@ -45,11 +60,21 @@ export async function POST(request: Request) {
   const depth = body.depth?.trim() ?? "";
   const userIntent = isUserIntent(body.userIntent) ? body.userIntent : detectUserIntentFromTranscript(transcript);
   const decisionFrame = isDecisionFramePayload(body.decisionFrame) ? body.decisionFrame : null;
+  const decisionFrameUpdate = isDecisionFrameUpdatePayload(body.decisionFrameUpdate) ? body.decisionFrameUpdate : null;
   const model = body.model?.trim() || CLARA_MODEL;
   const temperature = clampNumber(body.temperature, 0, 2, CLARA_DEFAULT_TEMPERATURE);
   const maxTokens = Math.round(clampNumber(body.maxTokens, 40, 800, CLARA_DEFAULT_MAX_TOKENS));
   const responseGuidance = buildResponseGuidance(transcript, userIntent, depth, memory, decisionFrame);
-  const userPrompt = buildLabUserPrompt({ task, transcript, opener, memory, depth, responseGuidance, decisionFrame });
+  const userPrompt = buildLabUserPrompt({
+    task,
+    transcript,
+    opener,
+    memory,
+    depth,
+    responseGuidance,
+    decisionFrame,
+    decisionFrameUpdate
+  });
   const debugPrompt = {
     model,
     temperature,
@@ -132,10 +157,12 @@ function buildLabUserPrompt({
   memory,
   depth,
   responseGuidance,
-  decisionFrame
+  decisionFrame,
+  decisionFrameUpdate
 }: Pick<Required<LabRequest>, "task" | "transcript" | "opener" | "memory" | "depth"> & {
   responseGuidance: ResponseGuidance;
   decisionFrame: DecisionFramePayload | null;
+  decisionFrameUpdate: DecisionFrameUpdatePayload | null;
 }) {
   return JSON.stringify(
     {
@@ -145,6 +172,7 @@ function buildLabUserPrompt({
       depth,
       responseGuidance,
       decisionFrame,
+      decisionFrameUpdate,
       transcript
     },
     null,
@@ -158,7 +186,10 @@ type UserIntent =
   | "polite_close"
   | "explicit_continue"
   | "correction"
-  | "explicit_stop";
+  | "explicit_stop"
+  | "confirm"
+  | "save"
+  | "ambiguous_response";
 
 type ResponseMove = "reflect_only" | "gentle_question" | "witness" | "save" | "close" | "continue" | "frame_decision";
 
@@ -197,6 +228,12 @@ function buildResponseGuidance(
   if (userIntent === "polite_close" || userIntent === "explicit_stop") {
     suggestedMove = "close";
     instructions.push("The user is closing. Respond briefly and do not ask another reflective question.");
+  } else if (userIntent === "save") {
+    suggestedMove = "save";
+    instructions.push("The user confirmed saving. Acknowledge briefly and do not add a new reflective question.");
+  } else if (userIntent === "ambiguous_response") {
+    suggestedMove = "gentle_question";
+    instructions.push("The user gave an ambiguous yes/no answer to a choice. Clarify the choice plainly.");
   } else if (seriousLifeEvent) {
     suggestedMove = "witness";
     instructions.push(
@@ -212,7 +249,10 @@ function buildResponseGuidance(
       "Briefly acknowledge the human weight of the question.",
       "Name the structure of the decision in plain language.",
       "Identify 2-4 threads, criteria, tradeoffs, or time horizons.",
+      "Make the response feel like the shared frame is being assembled.",
+      "If the latest reply added to the frame, acknowledge where it belongs: thread, tradeoff, criterion, known, unknown, or next step.",
       "Ask which thread the user wants to look at first.",
+      "Tie the question to one visible part of the frame.",
       "Do not become a pros/cons bot, force a matrix, sound like a consultant, or recommend an option."
     );
   } else if (continueRequested) {
@@ -224,6 +264,9 @@ function buildResponseGuidance(
   } else if (userIntent === "acknowledgement") {
     suggestedMove = "reflect_only";
     instructions.push("The user acknowledged. Keep it brief; acknowledgments often signal closure.");
+  } else if (userIntent === "confirm") {
+    suggestedMove = decisionMoment ? "frame_decision" : "continue";
+    instructions.push("The user confirmed Clara's framing. Continue from that frame instead of closing.");
   } else if (userIntent === "correction") {
     suggestedMove = "gentle_question";
     instructions.push("The user corrected Clara. Repair naturally before continuing.");
@@ -262,7 +305,21 @@ function isDecisionFramePayload(value: unknown): value is DecisionFramePayload {
   return (
     typeof value === "object" &&
     value !== null &&
-    ("question" in value || "decisionType" in value || "criteria" in value || "tradeoffs" in value)
+    ("question" in value || "decisionType" in value || "threads" in value || "criteria" in value || "tradeoffs" in value)
+  );
+}
+
+function isDecisionFrameUpdatePayload(value: unknown): value is DecisionFrameUpdatePayload {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    ("threads" in value ||
+      "criteria" in value ||
+      "tradeoffs" in value ||
+      "knowns" in value ||
+      "unknowns" in value ||
+      "currentFocus" in value ||
+      "nextStep" in value)
   );
 }
 
@@ -285,7 +342,10 @@ function isUserIntent(value: unknown): value is UserIntent {
     value === "polite_close" ||
     value === "explicit_continue" ||
     value === "correction" ||
-    value === "explicit_stop"
+    value === "explicit_stop" ||
+    value === "confirm" ||
+    value === "save" ||
+    value === "ambiguous_response"
   );
 }
 

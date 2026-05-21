@@ -7,7 +7,7 @@ type DepthLabel = "Keep it light" | "Go a little deeper";
 type HeaderDepthLabel = "Light" | "Deep";
 type EngineDepth = Depth;
 type StoredDepth = Depth | DepthLabel | "Light" | "Thoughtful" | "Deep" | "light" | "thoughtful" | "deep";
-type Tab = "Today" | "Moments" | "Meaning" | "History" | "Recap" | "Settings";
+type Tab = "Today" | "Moments" | "Meaning" | "Frames" | "History" | "Recap" | "Settings";
 type LengthBucket = "short" | "medium" | "long";
 type Sentiment = "positive" | "neutral" | "negative";
 type MessageRole = "clara" | "user";
@@ -21,7 +21,10 @@ type UserIntent =
   | "polite_close"
   | "explicit_continue"
   | "correction"
-  | "explicit_stop";
+  | "explicit_stop"
+  | "confirm"
+  | "save"
+  | "ambiguous_response";
 type TouchpointType =
   | "daily_check_in"
   | "morning_orientation"
@@ -118,15 +121,28 @@ type MeaningNote = {
 type DecisionFrame = {
   id: string;
   createdAt: string;
+  updatedAt: string;
   question: string;
   decisionType: DecisionFrameType;
-  options: string[];
+  status: DecisionFrameStatus;
+  threads: string[];
   criteria: string[];
   tradeoffs: string[];
+  knowns: string[];
+  unknowns: string[];
+  currentFocus: string | null;
   nextStep: string | null;
-  status: DecisionFrameStatus;
-  sourceSessionId?: string;
-  sourceTouchpointType?: TouchpointType;
+  sourceSessionId: string | null;
+};
+
+type DecisionFrameUpdate = {
+  threads: string[];
+  criteria: string[];
+  tradeoffs: string[];
+  knowns: string[];
+  unknowns: string[];
+  currentFocus: string | null;
+  nextStep: string | null;
 };
 
 type LegacyEntry = {
@@ -181,6 +197,7 @@ type ClaraLabResponse = {
 type UserIntentContext = {
   userIntent: UserIntent;
   decisionFrame?: DecisionFrame | null;
+  decisionFrameUpdate?: DecisionFrameUpdate | null;
 };
 
 type MeaningNoteResponse = {
@@ -1089,6 +1106,9 @@ function detectUserIntent(text: string, session: CurrentSession): UserIntent {
   if (isExplicitStopSignal(text) || isCloseChoice(text) || isStoppingSignal(text)) return "explicit_stop";
   if (isCorrectionSignal(text)) return "correction";
 
+  const contextualYesNoIntent = detectContextualYesNoIntent(text, session);
+  if (contextualYesNoIntent) return contextualYesNoIntent;
+
   if (isAcknowledgement(text)) {
     const previousUserMessage = [...session.messages].reverse().find((message) => message.role === "user")?.text ?? "";
     const previousUserIntent = previousUserMessage ? detectUserIntent(previousUserMessage, emptyIntentSession()) : null;
@@ -1105,6 +1125,72 @@ function detectUserIntent(text: string, session: CurrentSession): UserIntent {
   }
 
   return "substantive_response";
+}
+
+function detectContextualYesNoIntent(text: string, session: CurrentSession): UserIntent | null {
+  if (!isYesSignal(text) && !isNoSignal(text)) return null;
+
+  const latestClaraText = [...session.messages].reverse().find((message) => message.role === "clara")?.text ?? "";
+  const lower = latestClaraText.toLowerCase();
+  const latestClaraAskedQuestion = lower.includes("?");
+
+  if (!latestClaraAskedQuestion) return null;
+
+  if (isYesSignal(text)) {
+    const askedToSave = claraAskedToSave(lower);
+    const askedToContinue = claraAskedToContinue(lower);
+    if (askedToSave && askedToContinue) return "ambiguous_response";
+    if (askedToSave) return "save";
+    if (askedToContinue) return "explicit_continue";
+    if (claraAskedForConfirmation(lower)) return "confirm";
+    if (claraAskedAmbiguousChoice(lower)) return "ambiguous_response";
+    return "substantive_response";
+  }
+
+  const askedToSave = claraAskedToSave(lower);
+  const askedToContinue = claraAskedToContinue(lower);
+  if (askedToSave && askedToContinue) return "ambiguous_response";
+  if (askedToContinue) return "explicit_stop";
+  if (askedToSave) return "explicit_continue";
+  if (claraAskedForConfirmation(lower)) return "correction";
+  if (claraAskedAmbiguousChoice(lower)) return "ambiguous_response";
+  return "substantive_response";
+}
+
+function isYesSignal(text: string) {
+  return ["yes", "yeah", "yep", "yup", "sure", "right", "correct"].includes(normalizeConversationalSignal(text));
+}
+
+function isNoSignal(text: string) {
+  return ["no", "nope", "nah", "not really"].includes(normalizeConversationalSignal(text));
+}
+
+function claraAskedToSave(text: string) {
+  return /\bsave\b/.test(text) || /\bkeep this\b/.test(text);
+}
+
+function claraAskedToContinue(text: string) {
+  return /\bkeep going\b/.test(text) || /\bcontinue\b/.test(text) || /\bstay with\b/.test(text) || /\bgo deeper\b/.test(text);
+}
+
+function claraAskedForConfirmation(text: string) {
+  return (
+    /\bdoes that feel (right|true)\b/.test(text) ||
+    /\bis that (right|true)\b/.test(text) ||
+    /\bdid i get that\b/.test(text) ||
+    /\bdoes that fit\b/.test(text)
+  );
+}
+
+function claraAskedAmbiguousChoice(text: string) {
+  return (
+    /\bor\b/.test(text) &&
+    (/\bwhich\b/.test(text) ||
+      /\bdo you want to look\b/.test(text) ||
+      /\blook next\b/.test(text) ||
+      /\bfirst\b/.test(text) ||
+      /\bside\b/.test(text))
+  );
 }
 
 function emptyIntentSession(): CurrentSession {
@@ -1142,6 +1228,7 @@ function findLastMessageIndex(messages: ConversationMessage[], role: MessageRole
 
 function isAcknowledgement(text: string) {
   return [
+    "yes",
     "thanks",
     "thank you",
     "thx",
@@ -1402,7 +1489,8 @@ async function generateClaraFromConversation(
     profileMemory(profile, previousSessions),
     sessionTouchpointContext(session),
     intentContext ? `Detected user intent: ${intentContext.userIntent}` : "",
-    intentContext?.decisionFrame ? decisionFrameMemory(intentContext.decisionFrame) : ""
+    intentContext?.decisionFrame ? decisionFrameMemory(intentContext.decisionFrame) : "",
+    intentContext?.decisionFrameUpdate ? decisionFrameUpdateMemory(intentContext.decisionFrameUpdate) : ""
   ]
     .filter(Boolean)
     .join("\n");
@@ -1414,7 +1502,8 @@ async function generateClaraFromConversation(
       memory,
       depth: session.currentDepth,
       userIntent: intentContext?.userIntent,
-      decisionFrame: intentContext?.decisionFrame
+      decisionFrame: intentContext?.decisionFrame,
+      decisionFrameUpdate: intentContext?.decisionFrameUpdate
     });
     const response = await fetch("/api/clara-lab", {
       method: "POST",
@@ -1427,7 +1516,8 @@ async function generateClaraFromConversation(
         memory,
         depth: session.currentDepth,
         userIntent: intentContext?.userIntent,
-        decisionFrame: intentContext?.decisionFrame
+        decisionFrame: intentContext?.decisionFrame,
+        decisionFrameUpdate: intentContext?.decisionFrameUpdate
       })
     });
 
@@ -1467,7 +1557,7 @@ function fallbackConversationText(session: CurrentSession) {
 
   if (isDecisionMoment(latestUser)) {
     const frame = decisionFrameFromText(latestUser, session);
-    const threads = frame.criteria.slice(0, 3).join(", ");
+    const threads = frame.threads.slice(0, 3).join(", ");
     const tradeoff = frame.tradeoffs[0];
 
     if (tradeoff) {
@@ -1570,7 +1660,7 @@ function fallbackClaraText(intent: ResponseIntent) {
 }
 
 function isSaveChoice(text: string) {
-  return ["save this", "save it", "yes", "mark that", "keep it close"].includes(normalizeChoice(text));
+  return ["save this", "save it", "mark that", "keep it close"].includes(normalizeChoice(text));
 }
 
 function isCloseChoice(text: string) {
@@ -1749,19 +1839,29 @@ function isDecisionMoment(text: string) {
 
 function decisionFrameFromText(text: string, session: CurrentSession): DecisionFrame {
   const decisionType = inferDecisionType(text);
+  const createdAt = new Date().toISOString();
+  const criteria = inferDecisionCriteria(text, decisionType);
+  const tradeoffs = inferDecisionTradeoffs(text, decisionType);
+  const threads = inferDecisionThreads(text, decisionType, criteria, tradeoffs);
+  const knowns = inferDecisionKnowns(text, decisionType);
+  const unknowns = inferDecisionUnknowns(text, decisionType);
+  const currentFocus = chooseDecisionCurrentFocus({ threads, criteria, tradeoffs, unknowns });
 
   return {
     id: crypto.randomUUID(),
-    createdAt: new Date().toISOString(),
+    createdAt,
+    updatedAt: createdAt,
     question: decisionQuestionFromText(text),
     decisionType,
-    options: inferDecisionOptions(text, decisionType),
-    criteria: inferDecisionCriteria(text, decisionType),
-    tradeoffs: inferDecisionTradeoffs(text, decisionType),
-    nextStep: inferDecisionNextStep(text, decisionType),
     status: "open",
-    sourceSessionId: session.sessionId,
-    sourceTouchpointType: session.touchpointType ?? "daily_check_in"
+    threads,
+    criteria,
+    tradeoffs,
+    knowns,
+    unknowns,
+    currentFocus,
+    nextStep: inferDecisionNextStep(text, decisionType, tradeoffs),
+    sourceSessionId: session.sessionId
   };
 }
 
@@ -1798,6 +1898,37 @@ function inferDecisionOptions(text: string, decisionType: DecisionFrameType) {
   if (decisionType === "meeting") return ["prepare the outcome", "prepare the role", "prepare the tone"];
 
   return [];
+}
+
+function inferDecisionThreads(
+  text: string,
+  decisionType: DecisionFrameType,
+  criteria: string[] = [],
+  tradeoffs: string[] = []
+) {
+  const lower = text.toLowerCase();
+  const threads: string[] = [];
+
+  if (/\bkids?|children|school|teacher|program|challeng/.test(lower)) {
+    threads.push("kids' happiness now", "academic challenge", "what they may need later");
+  }
+  if (/\bbudget cuts?|programs? .*\bcut|teachers? .*\bcut\b/.test(lower)) {
+    threads.push("future school cuts");
+  }
+  if (/\bmove|moving|town|home|community|friends?\b/.test(lower)) {
+    threads.push("belonging where you are", "cost of moving");
+  }
+  if (/\bjob|career|work\b/.test(lower)) {
+    threads.push("growth", "stability", "energy", "family load");
+  }
+  if (decisionType === "meeting") {
+    threads.push("meeting outcome", "your role", "how you want to show up");
+  }
+  if (decisionType === "goals") {
+    threads.push("what deserves attention", "actual bandwidth", "this season of life");
+  }
+
+  return uniqueStrings([...threads, ...tradeoffs, ...criteria]).slice(0, 5);
 }
 
 function inferDecisionCriteria(text: string, decisionType: DecisionFrameType) {
@@ -1855,9 +1986,62 @@ function inferDecisionTradeoffs(text: string, decisionType: DecisionFrameType) {
   return uniqueStrings(tradeoffs).slice(0, 4);
 }
 
-function inferDecisionNextStep(text: string, decisionType: DecisionFrameType) {
+function inferDecisionKnowns(text: string, decisionType: DecisionFrameType) {
+  const lower = text.toLowerCase();
+  const knowns: string[] = [];
+
+  if (/\bkids?|children\b/.test(lower) && /\bhappy\b/.test(lower)) knowns.push("the kids are happy here");
+  if (/\bbudget cuts?\b/.test(lower)) knowns.push("budget cuts are part of the picture");
+  if (/\bprograms? .*\bcut|teachers? .*\bcut\b/.test(lower)) knowns.push("programs or teachers may be cut");
+  if (/\bnot being challenged|not challenged|aren'?t challenged|arent challenged\b/.test(lower)) {
+    knowns.push("the current challenge level is a concern");
+  }
+  if (/\bbig meeting|meeting coming up\b/.test(lower)) knowns.push("there is a meeting coming up");
+  if (/\bdeciding|trying to choose|trying to decide|thinking about\b/.test(lower)) {
+    knowns.push("this is still open");
+  }
+  if (decisionType === "goals" && /\bgoals?\b/.test(lower)) knowns.push("the question is about what to aim at");
+
+  return uniqueStrings(knowns).slice(0, 5);
+}
+
+function inferDecisionUnknowns(text: string, decisionType: DecisionFrameType) {
+  const lower = text.toLowerCase();
+  const unknowns: string[] = [];
+
+  if (/\bchalleng|academic|school\b/.test(lower)) unknowns.push("whether the current environment will stretch them enough");
+  if (/\bbudget cuts?|programs? .*\bcut|teachers? .*\bcut\b/.test(lower)) {
+    unknowns.push("what the cuts will actually change");
+  }
+  if (/\bmove|moving|town|home|community|friends?\b/.test(lower)) unknowns.push("what moving would cost socially");
+  if (/\bjob|career|work\b/.test(lower)) unknowns.push("what the change would ask from your energy and family life");
+  if (decisionType === "meeting") unknowns.push("what outcome would make the meeting worth it");
+  if (decisionType === "goals") unknowns.push("what has enough room to matter right now");
+  if (/\bi don'?t know|not sure|unclear|wonder|worry\b/.test(lower)) {
+    unknowns.push(shortenDecisionItem(text));
+  }
+
+  return uniqueStrings(unknowns).slice(0, 5);
+}
+
+function chooseDecisionCurrentFocus({
+  threads,
+  criteria,
+  tradeoffs,
+  unknowns
+}: {
+  threads: string[];
+  criteria: string[];
+  tradeoffs: string[];
+  unknowns: string[];
+}) {
+  return tradeoffs[0] ?? threads[0] ?? criteria[0] ?? unknowns[0] ?? null;
+}
+
+function inferDecisionNextStep(text: string, decisionType: DecisionFrameType, tradeoffs: string[] = []) {
   if (decisionType === "meeting") return "Name the outcome that would make the meeting worth the time.";
   if (decisionType === "goals") return "Choose the one area that deserves attention first.";
+  if (tradeoffs.length > 0) return "Choose which side of the tradeoff feels heavier right now.";
   if (inferDecisionOptions(text, decisionType).length > 1) return "Name which option feels most alive or most costly right now.";
   return "Choose the thread to explore first.";
 }
@@ -1870,16 +2054,164 @@ function uniqueStrings(values: string[]) {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
 }
 
+function inferDecisionFrameUpdate(text: string, frame: DecisionFrame): DecisionFrameUpdate {
+  if (isLowSignalFrameReply(text)) {
+    return emptyDecisionFrameUpdate(frame.currentFocus);
+  }
+
+  const lower = text.toLowerCase();
+  const threads: string[] = [];
+  const criteria: string[] = [];
+  const tradeoffs: string[] = [];
+  const knowns: string[] = [];
+  const unknowns: string[] = [];
+  let nextStep: string | null = null;
+
+  if (/\bhappy\b/.test(lower) && /\bchalleng|growth|academic|school\b/.test(lower)) {
+    threads.push("kids' happiness now", "academic growth over time");
+    criteria.push("happiness", "academic challenge");
+    tradeoffs.push("happiness now vs growth over time");
+    knowns.push("the kids are happy here");
+    unknowns.push("whether they are being challenged enough");
+  }
+
+  if (/\bbudget cuts?|programs? .*\bcut|teachers? .*\bcut\b/.test(lower)) {
+    threads.push("future school cuts");
+    tradeoffs.push("stability now vs uncertainty ahead");
+    knowns.push("cuts are part of the picture");
+    unknowns.push("what the cuts will actually change");
+  }
+
+  if (/\bmove|moving|town|home|community|friends?\b/.test(lower)) {
+    threads.push("belonging where you are", "cost of moving");
+    criteria.push("belonging", "stability");
+    tradeoffs.push("stability vs change");
+    unknowns.push("what moving would cost socially");
+  }
+
+  if (/\bjob|career|work\b/.test(lower)) {
+    threads.push("growth", "stability", "energy", "family load");
+    criteria.push("growth", "stability", "energy");
+    tradeoffs.push("growth vs stability");
+    unknowns.push("what this would ask from your energy and family life");
+  }
+
+  if (/\bmeeting\b/.test(lower)) {
+    threads.push("meeting outcome", "your role", "how you want to show up");
+    criteria.push("outcome", "role", "mindset");
+    unknowns.push("what outcome would make the meeting worth it");
+    nextStep = "Name the outcome that would make the meeting worth the time.";
+  }
+
+  if (/\bgoal|goals\b/.test(lower)) {
+    threads.push("what deserves attention", "actual bandwidth");
+    criteria.push("attention", "capacity");
+    tradeoffs.push("ambition vs bandwidth");
+  }
+
+  if (/\bi know|we know|definitely|for sure|it's clear|its clear\b/.test(lower)) {
+    knowns.push(shortenDecisionItem(text));
+  }
+
+  if (/\bi don'?t know|we don'?t know|not sure|unclear|wonder|worry|question is\b/.test(lower)) {
+    unknowns.push(shortenDecisionItem(text));
+  }
+
+  if (/\bnext step|we should|i should|need to|we need to|i need to\b/.test(lower)) {
+    nextStep = shortenDecisionItem(text);
+  }
+
+  if (threads.length === 0 && criteria.length === 0 && tradeoffs.length === 0 && knowns.length === 0 && unknowns.length === 0) {
+    if (text.trim().split(/\s+/).filter(Boolean).length >= 8) {
+      knowns.push(shortenDecisionItem(text));
+    }
+  }
+
+  return {
+    threads: uniqueStrings(threads).slice(0, 5),
+    criteria: uniqueStrings(criteria).slice(0, 5),
+    tradeoffs: uniqueStrings(tradeoffs).slice(0, 5),
+    knowns: uniqueStrings(knowns).slice(0, 5),
+    unknowns: uniqueStrings(unknowns).slice(0, 5),
+    currentFocus: chooseDecisionCurrentFocus({ threads, criteria, tradeoffs, unknowns }) ?? frame.currentFocus,
+    nextStep
+  };
+}
+
+function applyDecisionFrameUpdate(frame: DecisionFrame, update: DecisionFrameUpdate): DecisionFrame {
+  return {
+    ...frame,
+    updatedAt: new Date().toISOString(),
+    threads: uniqueStrings([...frame.threads, ...update.threads]).slice(0, 8),
+    criteria: uniqueStrings([...frame.criteria, ...update.criteria]).slice(0, 8),
+    tradeoffs: uniqueStrings([...frame.tradeoffs, ...update.tradeoffs]).slice(0, 8),
+    knowns: uniqueStrings([...frame.knowns, ...update.knowns]).slice(0, 8),
+    unknowns: uniqueStrings([...frame.unknowns, ...update.unknowns]).slice(0, 8),
+    currentFocus: update.currentFocus ?? frame.currentFocus,
+    nextStep: update.nextStep ?? frame.nextStep
+  };
+}
+
+function emptyDecisionFrameUpdate(currentFocus: string | null): DecisionFrameUpdate {
+  return {
+    threads: [],
+    criteria: [],
+    tradeoffs: [],
+    knowns: [],
+    unknowns: [],
+    currentFocus,
+    nextStep: null
+  };
+}
+
+function hasDecisionFrameUpdate(update: DecisionFrameUpdate) {
+  return (
+    update.threads.length > 0 ||
+    update.criteria.length > 0 ||
+    update.tradeoffs.length > 0 ||
+    update.knowns.length > 0 ||
+    update.unknowns.length > 0 ||
+    update.nextStep !== null
+  );
+}
+
+function isLowSignalFrameReply(text: string) {
+  return isYesSignal(text) || isNoSignal(text) || isAcknowledgement(text) || isContinueSignal(text);
+}
+
+function decisionFrameUpdateMemory(update: DecisionFrameUpdate) {
+  if (!hasDecisionFrameUpdate(update)) return "";
+
+  const lines = [
+    "Latest user reply added to the frame:",
+    update.threads.length > 0 ? `Threads added: ${update.threads.join(", ")}` : "",
+    update.criteria.length > 0 ? `Criteria added: ${update.criteria.join(", ")}` : "",
+    update.tradeoffs.length > 0 ? `Tradeoffs added: ${update.tradeoffs.join(", ")}` : "",
+    update.knowns.length > 0 ? `Knowns added: ${update.knowns.join(", ")}` : "",
+    update.unknowns.length > 0 ? `Unknowns added: ${update.unknowns.join(", ")}` : "",
+    update.currentFocus ? `Current focus: ${update.currentFocus}` : "",
+    update.nextStep ? `Next step added: ${update.nextStep}` : "",
+    "Acknowledge the frame update naturally. Say things like 'I'd put that under tradeoffs' or 'That seems like one of the big unknowns.'"
+  ];
+
+  return lines.filter(Boolean).join("\n");
+}
+
 function decisionFrameMemory(frame: DecisionFrame) {
   const lines = [
     "Decision Frame v1 is active.",
     `Decision question: ${frame.question}`,
     `Decision type: ${frame.decisionType}`,
-    frame.options.length > 0 ? `Possible options: ${frame.options.join(", ")}` : "",
-    frame.criteria.length > 0 ? `Possible criteria or threads: ${frame.criteria.join(", ")}` : "",
-    frame.tradeoffs.length > 0 ? `Possible tradeoffs: ${frame.tradeoffs.join(", ")}` : "",
-    frame.nextStep ? `Possible small next step: ${frame.nextStep}` : "",
-    "Use the frame_decision listening move. Do not decide for the user. Ask which thread they want to explore first."
+    `Frame status: ${frame.status}`,
+    frame.currentFocus ? `Current focus: ${frame.currentFocus}` : "",
+    frame.threads.length > 0 ? `Threads: ${frame.threads.join(", ")}` : "",
+    frame.criteria.length > 0 ? `Criteria: ${frame.criteria.join(", ")}` : "",
+    frame.tradeoffs.length > 0 ? `Tradeoffs: ${frame.tradeoffs.join(", ")}` : "",
+    frame.knowns.length > 0 ? `Knowns: ${frame.knowns.join(", ")}` : "",
+    frame.unknowns.length > 0 ? `Unknowns: ${frame.unknowns.join(", ")}` : "",
+    frame.nextStep ? `Small next step: ${frame.nextStep}` : "",
+    "Use the frame_decision listening move. Do not decide for the user.",
+    "Each question should connect to one part of the frame: a thread, tradeoff, criterion, unknown, or next step."
   ];
 
   return lines.filter(Boolean).join("\n");
@@ -1887,6 +2219,15 @@ function decisionFrameMemory(frame: DecisionFrame) {
 
 function sameDecisionFrame(a: DecisionFrame, b: DecisionFrame) {
   return a.sourceSessionId === b.sourceSessionId && normalizeDecisionQuestion(a.question) === normalizeDecisionQuestion(b.question);
+}
+
+function activeDecisionFrameForSession(frames: DecisionFrame[], session: CurrentSession | null) {
+  if (!session) return null;
+  return frames.find((frame) => frame.sourceSessionId === session.sessionId && frame.status === "open") ?? null;
+}
+
+function shouldUpdateDecisionFrameFromIntent(intent: UserIntent) {
+  return intent === "substantive_response" || intent === "confirm" || intent === "correction";
 }
 
 function normalizeDecisionQuestion(text: string) {
@@ -2151,17 +2492,67 @@ function isDecisionFrame(value: unknown): value is DecisionFrame {
     isRecord(value) &&
     typeof value.id === "string" &&
     typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string" &&
     typeof value.question === "string" &&
     isDecisionFrameType(value.decisionType) &&
-    Array.isArray(value.options) &&
-    value.options.every((item) => typeof item === "string") &&
+    isDecisionFrameStatus(value.status) &&
+    Array.isArray(value.threads) &&
+    value.threads.every((item) => typeof item === "string") &&
     Array.isArray(value.criteria) &&
     value.criteria.every((item) => typeof item === "string") &&
     Array.isArray(value.tradeoffs) &&
     value.tradeoffs.every((item) => typeof item === "string") &&
+    Array.isArray(value.knowns) &&
+    value.knowns.every((item) => typeof item === "string") &&
+    Array.isArray(value.unknowns) &&
+    value.unknowns.every((item) => typeof item === "string") &&
+    (value.currentFocus === null || typeof value.currentFocus === "string") &&
     (value.nextStep === null || typeof value.nextStep === "string") &&
-    isDecisionFrameStatus(value.status)
+    (value.sourceSessionId === null || typeof value.sourceSessionId === "string")
   );
+}
+
+function normalizeDecisionFrame(value: unknown): DecisionFrame | null {
+  if (!isRecord(value)) return null;
+
+  if (isDecisionFrame(value)) {
+    return value;
+  }
+
+  if (
+    typeof value.id !== "string" ||
+    typeof value.createdAt !== "string" ||
+    typeof value.question !== "string" ||
+    !isDecisionFrameType(value.decisionType)
+  ) {
+    return null;
+  }
+
+  const criteria = cleanStringList(value.criteria);
+  const tradeoffs = cleanStringList(value.tradeoffs);
+  const legacyOptions = cleanStringList(value.options);
+  const threads = uniqueStrings([...cleanStringList(value.threads), ...legacyOptions, ...tradeoffs, ...criteria]).slice(0, 8);
+  const unknowns = cleanStringList(value.unknowns);
+
+  return {
+    id: value.id,
+    createdAt: value.createdAt,
+    updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : value.createdAt,
+    question: value.question,
+    decisionType: value.decisionType,
+    status: isDecisionFrameStatus(value.status) ? value.status : "open",
+    threads,
+    criteria,
+    tradeoffs,
+    knowns: cleanStringList(value.knowns),
+    unknowns,
+    currentFocus:
+      typeof value.currentFocus === "string"
+        ? value.currentFocus
+        : chooseDecisionCurrentFocus({ threads, criteria, tradeoffs, unknowns }),
+    nextStep: typeof value.nextStep === "string" ? value.nextStep : null,
+    sourceSessionId: typeof value.sourceSessionId === "string" ? value.sourceSessionId : null
+  };
 }
 
 function normalizeSession(session: CurrentSession): CurrentSession {
@@ -2283,7 +2674,9 @@ function readDecisionFramesFromStorage(): DecisionFrame[] {
   const parsedFrames = parseStoredJson<unknown>(storedFrames);
 
   if (Array.isArray(parsedFrames)) {
-    return parsedFrames.filter(isDecisionFrame);
+    return parsedFrames
+      .map(normalizeDecisionFrame)
+      .filter((frame): frame is DecisionFrame => frame !== null);
   }
 
   if (storedFrames) {
@@ -2511,6 +2904,27 @@ export default function Home() {
       return;
     }
 
+    if (detectedUserIntent === "save") {
+      await closeSession(trimmed, "Saved. That's a good place to leave it for today.");
+      return;
+    }
+
+    if (detectedUserIntent === "ambiguous_response") {
+      setCurrentSession({
+        ...currentSession,
+        messages: [
+          ...currentSession.messages,
+          makeUserMessage(trimmed),
+          makeClaraMessage({
+            text: "I need one clearer choice. Which part should we look at first?",
+            expectedInput: "text"
+          })
+        ]
+      });
+      setAnswer("");
+      return;
+    }
+
     if (isCloseChoice(trimmed)) {
       await closeSession(trimmed);
       return;
@@ -2526,13 +2940,28 @@ export default function Home() {
       ...withDepthState(currentSession, trimmed),
       messages: [...currentSession.messages, userMessage]
     };
-    const decisionFrame = isDecisionMoment(trimmed) ? decisionFrameFromText(trimmed, sessionWithReply) : null;
+    const existingDecisionFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
+    const newDecisionFrame = isDecisionMoment(trimmed) ? decisionFrameFromText(trimmed, sessionWithReply) : null;
+    let decisionFrame = newDecisionFrame ?? existingDecisionFrame;
+    let decisionFrameUpdate: DecisionFrameUpdate | null = null;
 
-    if (decisionFrame) {
-      console.log("Decision Frame detected", decisionFrame);
+    if (newDecisionFrame) {
+      console.log("Decision Frame detected", newDecisionFrame);
       setDecisionFrames((current) =>
-        current.some((frame) => sameDecisionFrame(frame, decisionFrame)) ? current : [decisionFrame, ...current]
+        current.some((frame) => sameDecisionFrame(frame, newDecisionFrame)) ? current : [newDecisionFrame, ...current]
       );
+    } else if (existingDecisionFrame && shouldUpdateDecisionFrameFromIntent(detectedUserIntent)) {
+      const update = inferDecisionFrameUpdate(trimmed, existingDecisionFrame);
+      const updatedDecisionFrame = applyDecisionFrameUpdate(existingDecisionFrame, update);
+      decisionFrame = updatedDecisionFrame;
+      decisionFrameUpdate = hasDecisionFrameUpdate(update) ? update : null;
+
+      if (decisionFrameUpdate) {
+        console.log("Decision Frame updated", { frame: updatedDecisionFrame, update });
+        setDecisionFrames((current) =>
+          current.map((frame) => (frame.id === updatedDecisionFrame.id ? updatedDecisionFrame : frame))
+        );
+      }
     }
 
     if (shouldCloseForDepth(sessionWithReply, trimmed)) {
@@ -2551,7 +2980,8 @@ export default function Home() {
       };
       const claraResult = await generateClaraFromConversation(redirectedSession, profile, sessions, {
         userIntent: detectedUserIntent,
-        decisionFrame
+        decisionFrame,
+        decisionFrameUpdate
       });
       setCurrentSession(maybeApplyDepthCheck({
         ...redirectedSession,
@@ -2570,7 +3000,8 @@ export default function Home() {
     if (isThreadCorrectionChoice && (normalizeChoice(trimmed) === "yes, that" || normalizeChoice(trimmed) === "yes that")) {
       const claraResult = await generateClaraFromConversation(sessionWithReply, profile, sessions, {
         userIntent: detectedUserIntent,
-        decisionFrame
+        decisionFrame,
+        decisionFrameUpdate
       });
       setCurrentSession(maybeApplyDepthCheck({
         ...sessionWithReply,
@@ -2589,7 +3020,8 @@ export default function Home() {
 
     const claraResult = await generateClaraFromConversation(sessionWithReply, profile, sessions, {
       userIntent: detectedUserIntent,
-      decisionFrame
+      decisionFrame,
+      decisionFrameUpdate
     });
     setCurrentSession(
       maybeApplyDepthCheck({
@@ -2889,13 +3321,17 @@ export default function Home() {
   function toggleDecisionFrameStatus(id: string) {
     setDecisionFrames((current) =>
       current.map((frame) =>
-        frame.id === id ? { ...frame, status: frame.status === "open" ? "closed" : "open" } : frame
+        frame.id === id
+          ? { ...frame, status: frame.status === "open" ? "closed" : "open", updatedAt: new Date().toISOString() }
+          : frame
       )
     );
   }
 
   function updateDecisionFrame(id: string, updates: Partial<DecisionFrame>) {
-    setDecisionFrames((current) => current.map((frame) => (frame.id === id ? { ...frame, ...updates } : frame)));
+    setDecisionFrames((current) =>
+      current.map((frame) => (frame.id === id ? { ...frame, ...updates, updatedAt: new Date().toISOString() } : frame))
+    );
   }
 
   function updateDepth(depth: Depth) {
@@ -3042,6 +3478,7 @@ export default function Home() {
   const optionalTextChoices = latestExpectedInput === "text" ? latestChoices : [];
   const currentSessionLabel = currentSession ? sessionDisplayLabel(currentSession) : "Daily check-in";
   const currentSessionIsTouchpoint = currentSession?.touchpointType && currentSession.touchpointType !== "daily_check_in";
+  const activeDecisionFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
 
   if (!ready) {
     return <main className="min-h-dvh px-5 py-8" />;
@@ -3111,6 +3548,8 @@ export default function Home() {
 
           {currentSession ? (
             <>
+              {activeDecisionFrame ? <FrameSoFarCard frame={activeDecisionFrame} /> : null}
+
               <section className="space-y-4">
                 {currentSession.messages.map((message, index) => (
                   <ConversationBubble message={message} key={`${message.timestamp}-${index}`} />
@@ -3305,27 +3744,27 @@ export default function Home() {
               meaningNotes.map((note) => <MeaningNoteCard note={note} key={note.id} />)
             )}
           </section>
+        </section>
+      )}
 
-          <section className="space-y-5 border-t border-pearl/10 pt-6">
-            <div className="space-y-1">
-              <p className="text-sm uppercase tracking-[0.2em] text-clay">Decision Frames</p>
-              <p className="text-base leading-6 text-fog">
-                Messy questions Clara has helped frame without deciding for you.
-              </p>
-            </div>
-            {decisionFrames.length === 0 ? (
-              <EmptyState text="Decision Frames will appear here when a check-in turns into a question to think through." />
-            ) : (
-              decisionFrames.map((frame) => (
-                <DecisionFrameCard
-                  frame={frame}
-                  key={frame.id}
-                  onToggleStatus={toggleDecisionFrameStatus}
-                  onUpdate={updateDecisionFrame}
-                />
-              ))
-            )}
-          </section>
+      {tab === "Frames" && (
+        <section className="space-y-5">
+          <ViewTitle eyebrow="Decision Frames" title="Messy questions, made visible." />
+          <p className="text-lg leading-7 text-fog">
+            Frames collect the threads, tradeoffs, knowns, unknowns, and next steps Clara helps surface.
+          </p>
+          {decisionFrames.length === 0 ? (
+            <EmptyState text="Decision Frames will appear here when a check-in turns into a question to think through." />
+          ) : (
+            decisionFrames.map((frame) => (
+              <DecisionFrameCard
+                frame={frame}
+                key={frame.id}
+                onToggleStatus={toggleDecisionFrameStatus}
+                onUpdate={updateDecisionFrame}
+              />
+            ))
+          )}
         </section>
       )}
 
@@ -3473,8 +3912,8 @@ export default function Home() {
       )}
 
       <nav className="fixed inset-x-0 bottom-0 border-t border-pearl/10 bg-ink/92 px-3 pb-[calc(1rem+env(safe-area-inset-bottom))] pt-3 backdrop-blur">
-        <div className="mx-auto grid max-w-md grid-cols-5 gap-1">
-          {(["Today", "Moments", "Meaning", "History", "Recap"] as Tab[]).map((item) => (
+        <div className="mx-auto grid max-w-md grid-cols-6 gap-1">
+          {(["Today", "Moments", "Meaning", "Frames", "History", "Recap"] as Tab[]).map((item) => (
             <button
               className={`rounded-md px-1 py-3 text-xs transition ${
                 tab === item ? "bg-pearl text-ink" : "text-fog hover:bg-pearl/8"
@@ -3622,6 +4061,45 @@ function MeaningNoteCard({ note }: { note: MeaningNote }) {
   );
 }
 
+function FrameSoFarCard({ frame }: { frame: DecisionFrame }) {
+  return (
+    <details className="rounded-md border border-pearl/10 bg-pearl/7 p-4" open>
+      <summary className="cursor-pointer text-sm uppercase tracking-[0.18em] text-clay">Frame so far</summary>
+      <div className="mt-4 space-y-3">
+        <p className="text-lg leading-7 text-pearl">{frame.question}</p>
+        {frame.currentFocus ? (
+          <div className="space-y-1">
+            <p className="text-sm text-clay">Current focus</p>
+            <p className="text-base leading-6 text-fog">{frame.currentFocus}</p>
+          </div>
+        ) : null}
+        {frame.threads.length > 0 ? (
+          <div className="space-y-2">
+            <p className="text-sm text-clay">Threads</p>
+            <TagList values={frame.threads.slice(0, 4)} />
+          </div>
+        ) : null}
+        {frame.tradeoffs.length > 0 ? (
+          <div className="space-y-2">
+            <p className="text-sm text-clay">Tradeoffs</p>
+            <TagList values={frame.tradeoffs.slice(0, 3)} />
+          </div>
+        ) : null}
+        {frame.unknowns.length > 0 ? (
+          <div className="space-y-2">
+            <p className="text-sm text-clay">Unknowns</p>
+            <ul className="space-y-1 text-base leading-6 text-fog">
+              {frame.unknowns.slice(0, 3).map((unknown) => (
+                <li key={unknown}>{unknown}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </div>
+    </details>
+  );
+}
+
 function DecisionFrameCard({
   frame,
   onToggleStatus,
@@ -3633,16 +4111,22 @@ function DecisionFrameCard({
 }) {
   const [editing, setEditing] = useState(false);
   const [question, setQuestion] = useState(frame.question);
-  const [options, setOptions] = useState(frame.options.join(", "));
+  const [threads, setThreads] = useState(frame.threads.join(", "));
   const [criteria, setCriteria] = useState(frame.criteria.join(", "));
   const [tradeoffs, setTradeoffs] = useState(frame.tradeoffs.join(", "));
+  const [knowns, setKnowns] = useState(frame.knowns.join(", "));
+  const [unknowns, setUnknowns] = useState(frame.unknowns.join(", "));
+  const [currentFocus, setCurrentFocus] = useState(frame.currentFocus ?? "");
   const [nextStep, setNextStep] = useState(frame.nextStep ?? "");
 
   function cancelEdit() {
     setQuestion(frame.question);
-    setOptions(frame.options.join(", "));
+    setThreads(frame.threads.join(", "));
     setCriteria(frame.criteria.join(", "));
     setTradeoffs(frame.tradeoffs.join(", "));
+    setKnowns(frame.knowns.join(", "));
+    setUnknowns(frame.unknowns.join(", "));
+    setCurrentFocus(frame.currentFocus ?? "");
     setNextStep(frame.nextStep ?? "");
     setEditing(false);
   }
@@ -3650,9 +4134,12 @@ function DecisionFrameCard({
   function saveEdit() {
     onUpdate(frame.id, {
       question: question.trim() || frame.question,
-      options: commaList(options),
+      threads: commaList(threads),
       criteria: commaList(criteria),
       tradeoffs: commaList(tradeoffs),
+      knowns: commaList(knowns),
+      unknowns: commaList(unknowns),
+      currentFocus: currentFocus.trim() || null,
       nextStep: nextStep.trim() || null
     });
     setEditing(false);
@@ -3675,9 +4162,12 @@ function DecisionFrameCard({
               onChange={(event) => setQuestion(event.target.value)}
             />
           </label>
-          <MiniField label="Options" value={options} onChange={setOptions} />
-          <MiniField label="Threads" value={criteria} onChange={setCriteria} />
+          <MiniField label="Threads" value={threads} onChange={setThreads} />
+          <MiniField label="Criteria" value={criteria} onChange={setCriteria} />
           <MiniField label="Tradeoffs" value={tradeoffs} onChange={setTradeoffs} />
+          <MiniField label="Knowns" value={knowns} onChange={setKnowns} />
+          <MiniField label="Unknowns" value={unknowns} onChange={setUnknowns} />
+          <MiniField label="Current focus" value={currentFocus} onChange={setCurrentFocus} />
           <MiniField label="Next step" value={nextStep} onChange={setNextStep} />
           <div className="flex flex-wrap gap-2">
             <button
@@ -3699,6 +4189,18 @@ function DecisionFrameCard({
       ) : (
         <>
           <p className="text-xl leading-8 text-pearl">{frame.question}</p>
+          {frame.currentFocus ? (
+            <div className="space-y-1">
+              <p className="text-sm text-clay">Current focus</p>
+              <p className="text-lg leading-7 text-fog">{frame.currentFocus}</p>
+            </div>
+          ) : null}
+          {frame.threads.length > 0 ? (
+            <div className="space-y-2">
+              <p className="text-sm text-clay">Key threads</p>
+              <TagList values={frame.threads} />
+            </div>
+          ) : null}
           {frame.tradeoffs.length > 0 ? (
             <div className="space-y-2">
               <p className="text-sm text-clay">Key tradeoffs</p>
@@ -3707,8 +4209,20 @@ function DecisionFrameCard({
           ) : null}
           {frame.criteria.length > 0 ? (
             <div className="space-y-2">
-              <p className="text-sm text-clay">Threads</p>
+              <p className="text-sm text-clay">Criteria</p>
               <TagList values={frame.criteria} />
+            </div>
+          ) : null}
+          {frame.knowns.length > 0 ? (
+            <div className="space-y-2">
+              <p className="text-sm text-clay">Knowns</p>
+              <TagList values={frame.knowns} />
+            </div>
+          ) : null}
+          {frame.unknowns.length > 0 ? (
+            <div className="space-y-2">
+              <p className="text-sm text-clay">Unknowns</p>
+              <TagList values={frame.unknowns} />
             </div>
           ) : null}
           {frame.nextStep ? (
