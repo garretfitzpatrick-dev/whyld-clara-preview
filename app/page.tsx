@@ -1561,10 +1561,10 @@ function fallbackConversationText(session: CurrentSession) {
     const tradeoff = frame.tradeoffs[0];
 
     if (tradeoff) {
-      return `This sounds like a real ${tradeoff} decision. I'd separate it into ${threads}. Which one feels most important to look at first?`;
+      return `This has a real tension: ${tradeoff}. I'd put what's involved into ${threads}. Which part feels most important to look at first?`;
     }
 
-    return `This sounds like a decision with a few moving pieces. I'd start with ${threads}. Which one should we look at first?`;
+    return `This sounds like a messy question with a few moving pieces. I'd start with ${threads}. Which part should we look at first?`;
   }
 
   if (lower.includes("work") && (lower.includes("annoying") || lower.includes("hard"))) {
@@ -2184,14 +2184,14 @@ function decisionFrameUpdateMemory(update: DecisionFrameUpdate) {
 
   const lines = [
     "Latest user reply added to the frame:",
-    update.threads.length > 0 ? `Threads added: ${update.threads.join(", ")}` : "",
-    update.criteria.length > 0 ? `Criteria added: ${update.criteria.join(", ")}` : "",
-    update.tradeoffs.length > 0 ? `Tradeoffs added: ${update.tradeoffs.join(", ")}` : "",
-    update.knowns.length > 0 ? `Knowns added: ${update.knowns.join(", ")}` : "",
-    update.unknowns.length > 0 ? `Unknowns added: ${update.unknowns.join(", ")}` : "",
+    update.threads.length > 0 ? `What's involved added: ${update.threads.join(", ")}` : "",
+    update.criteria.length > 0 ? `What matters added: ${update.criteria.join(", ")}` : "",
+    update.tradeoffs.length > 0 ? `Tensions added: ${update.tradeoffs.join(", ")}` : "",
+    update.knowns.length > 0 ? `What seems clear added: ${update.knowns.join(", ")}` : "",
+    update.unknowns.length > 0 ? `What we still don't know added: ${update.unknowns.join(", ")}` : "",
     update.currentFocus ? `Current focus: ${update.currentFocus}` : "",
-    update.nextStep ? `Next step added: ${update.nextStep}` : "",
-    "Acknowledge the frame update naturally. Say things like 'I'd put that under tradeoffs' or 'That seems like one of the big unknowns.'"
+    update.nextStep ? `Next honest step added: ${update.nextStep}` : "",
+    "Acknowledge the frame update naturally. Say things like 'I'd put that under tensions,' 'That seems like one of the big unknowns,' or 'That sounds like something that matters in the decision.'"
   ];
 
   return lines.filter(Boolean).join("\n");
@@ -2204,14 +2204,14 @@ function decisionFrameMemory(frame: DecisionFrame) {
     `Decision type: ${frame.decisionType}`,
     `Frame status: ${frame.status}`,
     frame.currentFocus ? `Current focus: ${frame.currentFocus}` : "",
-    frame.threads.length > 0 ? `Threads: ${frame.threads.join(", ")}` : "",
-    frame.criteria.length > 0 ? `Criteria: ${frame.criteria.join(", ")}` : "",
-    frame.tradeoffs.length > 0 ? `Tradeoffs: ${frame.tradeoffs.join(", ")}` : "",
-    frame.knowns.length > 0 ? `Knowns: ${frame.knowns.join(", ")}` : "",
-    frame.unknowns.length > 0 ? `Unknowns: ${frame.unknowns.join(", ")}` : "",
-    frame.nextStep ? `Small next step: ${frame.nextStep}` : "",
+    frame.threads.length > 0 ? `What's involved: ${frame.threads.join(", ")}` : "",
+    frame.criteria.length > 0 ? `What matters: ${frame.criteria.join(", ")}` : "",
+    frame.tradeoffs.length > 0 ? `Tensions: ${frame.tradeoffs.join(", ")}` : "",
+    frame.knowns.length > 0 ? `What seems clear: ${frame.knowns.join(", ")}` : "",
+    frame.unknowns.length > 0 ? `What we still don't know: ${frame.unknowns.join(", ")}` : "",
+    frame.nextStep ? `Next honest step: ${frame.nextStep}` : "",
     "Use the frame_decision listening move. Do not decide for the user.",
-    "Each question should connect to one part of the frame: a thread, tradeoff, criterion, unknown, or next step."
+    "Each question should connect to one part of the frame: what's involved, a tension, what matters, an unknown, or the next honest step."
   ];
 
   return lines.filter(Boolean).join("\n");
@@ -2753,6 +2753,7 @@ export default function Home() {
   const [weeklyMeaningError, setWeeklyMeaningError] = useState("");
   const [weeklyMeaningFeedback, setWeeklyMeaningFeedback] = useState("");
   const [settingsSaveMessage, setSettingsSaveMessage] = useState("");
+  const [selectedDecisionFrameId, setSelectedDecisionFrameId] = useState<string | null>(null);
   const settingsSaveTimer = useRef<number | null>(null);
 
   useEffect(() => {
@@ -3479,6 +3480,8 @@ export default function Home() {
   const currentSessionLabel = currentSession ? sessionDisplayLabel(currentSession) : "Daily check-in";
   const currentSessionIsTouchpoint = currentSession?.touchpointType && currentSession.touchpointType !== "daily_check_in";
   const activeDecisionFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
+  const selectedDecisionFrame =
+    selectedDecisionFrameId ? decisionFrames.find((frame) => frame.id === selectedDecisionFrameId) ?? null : null;
 
   if (!ready) {
     return <main className="min-h-dvh px-5 py-8" />;
@@ -3749,21 +3752,36 @@ export default function Home() {
 
       {tab === "Frames" && (
         <section className="space-y-5">
-          <ViewTitle eyebrow="Decision Frames" title="Messy questions, made visible." />
-          <p className="text-lg leading-7 text-fog">
-            Frames collect the threads, tradeoffs, knowns, unknowns, and next steps Clara helps surface.
-          </p>
-          {decisionFrames.length === 0 ? (
-            <EmptyState text="Decision Frames will appear here when a check-in turns into a question to think through." />
+          {selectedDecisionFrame ? (
+            <DecisionFrameDetail
+              frame={selectedDecisionFrame}
+              onBack={() => setSelectedDecisionFrameId(null)}
+              onToggleStatus={toggleDecisionFrameStatus}
+            />
           ) : (
-            decisionFrames.map((frame) => (
-              <DecisionFrameCard
-                frame={frame}
-                key={frame.id}
-                onToggleStatus={toggleDecisionFrameStatus}
-                onUpdate={updateDecisionFrame}
-              />
-            ))
+            <>
+              <ViewTitle eyebrow="Frames" title="Messy questions, made visible." />
+              <p className="text-lg leading-7 text-fog">
+                Frames help you see the shape of a messy question before choosing what to do.
+              </p>
+              <p className="text-base leading-6 text-clay">
+                Clara won't decide for you. She helps organize what matters, what's uncertain, and what the next honest
+                step might be.
+              </p>
+              {decisionFrames.length === 0 ? (
+                <EmptyState text="Frames will appear here when a check-in turns into a question to think through." />
+              ) : (
+                decisionFrames.map((frame) => (
+                  <DecisionFrameCard
+                    frame={frame}
+                    key={frame.id}
+                    onOpen={(id) => setSelectedDecisionFrameId(id)}
+                    onToggleStatus={toggleDecisionFrameStatus}
+                    onUpdate={updateDecisionFrame}
+                  />
+                ))
+              )}
+            </>
           )}
         </section>
       )}
@@ -4066,6 +4084,9 @@ function FrameSoFarCard({ frame }: { frame: DecisionFrame }) {
     <details className="rounded-md border border-pearl/10 bg-pearl/7 p-4" open>
       <summary className="cursor-pointer text-sm uppercase tracking-[0.18em] text-clay">Frame so far</summary>
       <div className="mt-4 space-y-3">
+        <p className="text-sm leading-6 text-fog">
+          Frames help you see the shape of a messy question before choosing what to do.
+        </p>
         <p className="text-lg leading-7 text-pearl">{frame.question}</p>
         {frame.currentFocus ? (
           <div className="space-y-1">
@@ -4073,39 +4094,134 @@ function FrameSoFarCard({ frame }: { frame: DecisionFrame }) {
             <p className="text-base leading-6 text-fog">{frame.currentFocus}</p>
           </div>
         ) : null}
-        {frame.threads.length > 0 ? (
-          <div className="space-y-2">
-            <p className="text-sm text-clay">Threads</p>
-            <TagList values={frame.threads.slice(0, 4)} />
-          </div>
-        ) : null}
-        {frame.tradeoffs.length > 0 ? (
-          <div className="space-y-2">
-            <p className="text-sm text-clay">Tradeoffs</p>
-            <TagList values={frame.tradeoffs.slice(0, 3)} />
-          </div>
-        ) : null}
-        {frame.unknowns.length > 0 ? (
-          <div className="space-y-2">
-            <p className="text-sm text-clay">Unknowns</p>
-            <ul className="space-y-1 text-base leading-6 text-fog">
-              {frame.unknowns.slice(0, 3).map((unknown) => (
-                <li key={unknown}>{unknown}</li>
-              ))}
-            </ul>
-          </div>
-        ) : null}
+        <CompactFrameSection label="What's involved" values={frame.threads} />
+        <CompactFrameSection label="Tensions" values={frame.tradeoffs} />
+        <CompactFrameSection label="What we still don't know" values={frame.unknowns} />
       </div>
+    </details>
+  );
+}
+
+function CompactFrameSection({ label, values }: { label: string; values: string[] }) {
+  const [expanded, setExpanded] = useState(false);
+  if (values.length === 0) return null;
+
+  const visibleValues = expanded ? values : values.slice(0, 3);
+  const hiddenCount = values.length - visibleValues.length;
+
+  return (
+    <div className="space-y-2">
+      <p className="text-sm text-clay">{label}</p>
+      <TagList values={visibleValues} />
+      {hiddenCount > 0 ? (
+        <button
+          className="text-sm text-fog underline decoration-pearl/30 underline-offset-4"
+          onClick={() => setExpanded((current) => !current)}
+          type="button"
+        >
+          {expanded ? "Show less" : `Show ${hiddenCount} more`}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function DecisionFrameDetail({
+  frame,
+  onBack,
+  onToggleStatus
+}: {
+  frame: DecisionFrame;
+  onBack: () => void;
+  onToggleStatus: (id: string) => void;
+}) {
+  return (
+    <section className="space-y-5">
+      <button
+        className="rounded-md border border-pearl/12 bg-pearl/7 px-4 py-3 text-sm text-fog transition hover:bg-pearl/10"
+        onClick={onBack}
+        type="button"
+      >
+        Back to Frames
+      </button>
+
+      <div className="space-y-3">
+        <p className="text-sm text-clay">{formatDecisionType(frame.decisionType)} Frame</p>
+        <h2 className="text-3xl leading-tight text-pearl">{frame.question}</h2>
+        <p className="text-base leading-6 text-fog">
+          Clara won't decide for you. She helps organize what matters, what's uncertain, and what the next honest step
+          might be.
+        </p>
+      </div>
+
+      <section className="space-y-2 rounded-md border border-pearl/10 bg-pearl/7 p-4">
+        <div className="flex items-center justify-between gap-4 text-sm text-fog">
+          <span>Status</span>
+          <span>{frame.status}</span>
+        </div>
+        <div className="flex items-center justify-between gap-4 text-sm text-fog">
+          <span>Created</span>
+          <span>{formatDate(frame.createdAt)}</span>
+        </div>
+        <div className="flex items-center justify-between gap-4 text-sm text-fog">
+          <span>Updated</span>
+          <span>{formatDate(frame.updatedAt)}</span>
+        </div>
+        <button
+          className="mt-2 w-full rounded-md border border-pearl/12 bg-ink/30 px-4 py-3 text-sm text-fog transition hover:bg-pearl/10"
+          onClick={() => onToggleStatus(frame.id)}
+          type="button"
+        >
+          Mark {frame.status === "open" ? "closed" : "open"}
+        </button>
+      </section>
+
+      {frame.currentFocus ? (
+        <section className="space-y-1 border-t border-pearl/10 pt-5">
+          <p className="text-sm text-clay">Current focus</p>
+          <p className="text-lg leading-7 text-fog">{frame.currentFocus}</p>
+        </section>
+      ) : null}
+
+      <FrameDetailSection label="What's involved" values={frame.threads} />
+      <FrameDetailSection label="What matters" values={frame.criteria} />
+      <FrameDetailSection label="Tensions" values={frame.tradeoffs} />
+      <FrameDetailSection label="What seems clear" values={frame.knowns} />
+      <FrameDetailSection label="What we still don't know" values={frame.unknowns} />
+
+      <section className="space-y-1 border-t border-pearl/10 pt-5">
+        <p className="text-sm text-clay">Next honest step</p>
+        <p className="text-lg leading-7 text-fog">{frame.nextStep || "Not clear yet."}</p>
+      </section>
+    </section>
+  );
+}
+
+function FrameDetailSection({ label, values }: { label: string; values: string[] }) {
+  return (
+    <details className="border-t border-pearl/10 pt-5" open>
+      <summary className="cursor-pointer text-sm text-clay">{label}</summary>
+      {values.length === 0 ? (
+        <p className="mt-3 text-lg leading-7 text-fog">Not clear yet.</p>
+      ) : (
+        <ul className="mt-3 space-y-2 text-lg leading-7 text-fog">
+          {values.map((value) => (
+            <li key={value}>{value}</li>
+          ))}
+        </ul>
+      )}
     </details>
   );
 }
 
 function DecisionFrameCard({
   frame,
+  onOpen,
   onToggleStatus,
   onUpdate
 }: {
   frame: DecisionFrame;
+  onOpen: (id: string) => void;
   onToggleStatus: (id: string) => void;
   onUpdate: (id: string, updates: Partial<DecisionFrame>) => void;
 }) {
@@ -4162,13 +4278,13 @@ function DecisionFrameCard({
               onChange={(event) => setQuestion(event.target.value)}
             />
           </label>
-          <MiniField label="Threads" value={threads} onChange={setThreads} />
-          <MiniField label="Criteria" value={criteria} onChange={setCriteria} />
-          <MiniField label="Tradeoffs" value={tradeoffs} onChange={setTradeoffs} />
-          <MiniField label="Knowns" value={knowns} onChange={setKnowns} />
-          <MiniField label="Unknowns" value={unknowns} onChange={setUnknowns} />
+          <MiniField label="What's involved" value={threads} onChange={setThreads} />
+          <MiniField label="What matters" value={criteria} onChange={setCriteria} />
+          <MiniField label="Tensions" value={tradeoffs} onChange={setTradeoffs} />
+          <MiniField label="What seems clear" value={knowns} onChange={setKnowns} />
+          <MiniField label="What we still don't know" value={unknowns} onChange={setUnknowns} />
           <MiniField label="Current focus" value={currentFocus} onChange={setCurrentFocus} />
-          <MiniField label="Next step" value={nextStep} onChange={setNextStep} />
+          <MiniField label="Next honest step" value={nextStep} onChange={setNextStep} />
           <div className="flex flex-wrap gap-2">
             <button
               className="rounded-md bg-clay px-4 py-3 text-sm font-medium text-ink transition hover:bg-[#cc9978]"
@@ -4197,41 +4313,30 @@ function DecisionFrameCard({
           ) : null}
           {frame.threads.length > 0 ? (
             <div className="space-y-2">
-              <p className="text-sm text-clay">Key threads</p>
-              <TagList values={frame.threads} />
+              <p className="text-sm text-clay">What's involved</p>
+              <TagList values={frame.threads.slice(0, 3)} />
             </div>
           ) : null}
           {frame.tradeoffs.length > 0 ? (
             <div className="space-y-2">
-              <p className="text-sm text-clay">Key tradeoffs</p>
-              <TagList values={frame.tradeoffs} />
-            </div>
-          ) : null}
-          {frame.criteria.length > 0 ? (
-            <div className="space-y-2">
-              <p className="text-sm text-clay">Criteria</p>
-              <TagList values={frame.criteria} />
-            </div>
-          ) : null}
-          {frame.knowns.length > 0 ? (
-            <div className="space-y-2">
-              <p className="text-sm text-clay">Knowns</p>
-              <TagList values={frame.knowns} />
-            </div>
-          ) : null}
-          {frame.unknowns.length > 0 ? (
-            <div className="space-y-2">
-              <p className="text-sm text-clay">Unknowns</p>
-              <TagList values={frame.unknowns} />
+              <p className="text-sm text-clay">Tensions</p>
+              <TagList values={frame.tradeoffs.slice(0, 3)} />
             </div>
           ) : null}
           {frame.nextStep ? (
             <div className="space-y-1">
-              <p className="text-sm text-clay">Next step</p>
+              <p className="text-sm text-clay">Next honest step</p>
               <p className="text-lg leading-7 text-fog">{frame.nextStep}</p>
             </div>
           ) : null}
           <div className="flex flex-wrap gap-2">
+            <button
+              className="rounded-md bg-clay px-4 py-3 text-sm font-medium text-ink transition hover:bg-[#cc9978]"
+              onClick={() => onOpen(frame.id)}
+              type="button"
+            >
+              Open frame
+            </button>
             <button
               className="rounded-md border border-pearl/12 bg-pearl/7 px-4 py-3 text-sm text-fog transition hover:bg-pearl/10"
               onClick={() => setEditing(true)}

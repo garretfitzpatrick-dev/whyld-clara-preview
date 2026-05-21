@@ -248,12 +248,13 @@ function buildResponseGuidance(
       "Decision/framing moment detected. Do not decide for the user.",
       "Briefly acknowledge the human weight of the question.",
       "Name the structure of the decision in plain language.",
-      "Identify 2-4 threads, criteria, tradeoffs, or time horizons.",
+      "Identify 2-4 pieces of what's involved, what matters, tensions, unknowns, or time horizons.",
       "Make the response feel like the shared frame is being assembled.",
-      "If the latest reply added to the frame, acknowledge where it belongs: thread, tradeoff, criterion, known, unknown, or next step.",
+      "If the latest reply added to the frame, acknowledge where it belongs: what's involved, tensions, what matters, what seems clear, what is still unknown, or next honest step.",
       "Ask which thread the user wants to look at first.",
       "Tie the question to one visible part of the frame.",
-      "Do not become a pros/cons bot, force a matrix, sound like a consultant, or recommend an option."
+      "Do not become a pros/cons bot, force a matrix, sound like a consultant, or recommend an option.",
+      "Avoid phrases like decision analysis, optimization, weighted criteria, matrix, or score."
     );
   } else if (continueRequested) {
     suggestedMove = "continue";
