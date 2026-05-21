@@ -1,9 +1,10 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 type Depth = "keep_it_light" | "go_a_little_deeper";
 type DepthLabel = "Keep it light" | "Go a little deeper";
+type HeaderDepthLabel = "Light" | "Deep";
 type EngineDepth = Depth;
 type StoredDepth = Depth | DepthLabel | "Light" | "Thoughtful" | "Deep" | "light" | "thoughtful" | "deep";
 type Tab = "Today" | "Moments" | "Meaning" | "History" | "Recap" | "Settings";
@@ -1717,6 +1718,18 @@ function engineToDepth(depth: EngineDepth): DepthLabel {
   return depth === "keep_it_light" ? "Keep it light" : "Go a little deeper";
 }
 
+function headerDepthLabel(depth: EngineDepth): HeaderDepthLabel {
+  return depth === "keep_it_light" ? "Light" : "Deep";
+}
+
+function depthHelperText(depth: Depth) {
+  if (depth === "keep_it_light") {
+    return "Brief, low-pressure check-ins. Clara won't dig unless the moment calls for it.";
+  }
+
+  return "More willing to explore patterns, tradeoffs, and what matters underneath.";
+}
+
 function normalizeEngineDepth(depth: unknown): EngineDepth {
   if (depth === "keep_it_light" || depth === "Keep it light" || depth === "light" || depth === "Light") {
     return "keep_it_light";
@@ -2095,6 +2108,8 @@ export default function Home() {
   const [weeklyMeaningLoading, setWeeklyMeaningLoading] = useState(false);
   const [weeklyMeaningError, setWeeklyMeaningError] = useState("");
   const [weeklyMeaningFeedback, setWeeklyMeaningFeedback] = useState("");
+  const [settingsSaveMessage, setSettingsSaveMessage] = useState("");
+  const settingsSaveTimer = useRef<number | null>(null);
 
   useEffect(() => {
     const parsedProfile = readProfileFromStorage();
@@ -2148,14 +2163,27 @@ export default function Home() {
     }
   }, [currentSession, ready]);
 
+  useEffect(() => {
+    return () => {
+      if (settingsSaveTimer.current) {
+        window.clearTimeout(settingsSaveTimer.current);
+      }
+    };
+  }, []);
+
   function saveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    const isSettingsSave = profile !== null;
     const nextProfile = { ...draftProfile };
     setProfile(nextProfile);
     window.localStorage.setItem(STORAGE_KEYS.profile, JSON.stringify(nextProfile));
 
     if (!currentSession) {
       setCurrentSession(createSession(depthToEngine(nextProfile.depth)));
+    }
+
+    if (isSettingsSave) {
+      flashSettingsSaved("Saved");
     }
   }
 
@@ -2590,10 +2618,11 @@ export default function Home() {
 
   function updateDepth(depth: Depth) {
     if (!profile) return;
-    const nextProfile = { ...profile, depth };
+    const nextProfile = { ...draftProfile, depth };
     setProfile(nextProfile);
     setDraftProfile(nextProfile);
     window.localStorage.setItem(STORAGE_KEYS.profile, JSON.stringify(nextProfile));
+    flashSettingsSaved("Mode saved");
 
     if (currentSession) {
       setCurrentSession({
@@ -2601,6 +2630,19 @@ export default function Home() {
         currentDepth: depthToEngine(depth)
       });
     }
+  }
+
+  function flashSettingsSaved(message: string) {
+    setSettingsSaveMessage(message);
+
+    if (settingsSaveTimer.current) {
+      window.clearTimeout(settingsSaveTimer.current);
+    }
+
+    settingsSaveTimer.current = window.setTimeout(() => {
+      setSettingsSaveMessage("");
+      settingsSaveTimer.current = null;
+    }, 2500);
   }
 
   function startNewSession() {
@@ -2767,14 +2809,11 @@ export default function Home() {
           <h1 className="mt-2 text-4xl leading-none text-pearl">Clara</h1>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <a className="rounded-md border border-pearl/15 px-3 py-2 text-sm text-fog" href="/lab">
-            Lab
-          </a>
           <button
             className="rounded-md border border-pearl/15 px-3 py-2 text-sm text-fog"
             onClick={() => setTab("Settings")}
           >
-            {currentSession ? engineToDepth(currentSession.currentDepth) : engineToDepth(profile.depth)}
+            {currentSession ? headerDepthLabel(currentSession.currentDepth) : headerDepthLabel(profile.depth)}
           </button>
         </div>
       </header>
@@ -3080,12 +3119,32 @@ export default function Home() {
             />
             <DepthPicker
               value={draftProfile.depth}
-              onChange={(depth) => setDraftProfile((current) => ({ ...current, depth }))}
+              onChange={updateDepth}
+              showDescriptions
             />
+            {settingsSaveMessage ? (
+              <p className="text-sm text-clay" role="status">
+                {settingsSaveMessage}
+              </p>
+            ) : null}
             <button className="w-full rounded-md bg-pearl px-5 py-4 text-base font-medium text-ink transition hover:bg-white">
               Save settings
             </button>
           </form>
+          <section className="space-y-3 border-t border-pearl/10 pt-6">
+            <div className="space-y-1">
+              <p className="text-sm uppercase tracking-[0.2em] text-clay">Developer</p>
+              <p className="text-base leading-6 text-fog">
+                Response-quality tools for tuning Clara outside the main check-in flow.
+              </p>
+            </div>
+            <a
+              className="block w-full rounded-md border border-pearl/12 bg-pearl/7 px-5 py-4 text-center text-base text-pearl transition hover:bg-pearl/10"
+              href="/lab"
+            >
+              Developer Lab
+            </a>
+          </section>
           <section className="space-y-3 border-t border-pearl/10 pt-6">
             <div className="space-y-1">
               <p className="text-sm uppercase tracking-[0.2em] text-clay">Prototype tools</p>
@@ -3105,7 +3164,7 @@ export default function Home() {
       )}
 
       <nav className="fixed inset-x-0 bottom-0 border-t border-pearl/10 bg-ink/92 px-3 pb-[calc(1rem+env(safe-area-inset-bottom))] pt-3 backdrop-blur">
-        <div className="mx-auto grid max-w-md grid-cols-6 gap-1">
+        <div className="mx-auto grid max-w-md grid-cols-5 gap-1">
           {(["Today", "Moments", "Meaning", "History", "Recap"] as Tab[]).map((item) => (
             <button
               className={`rounded-md px-1 py-3 text-xs transition ${
@@ -3117,9 +3176,6 @@ export default function Home() {
               {item === "Meaning" ? "Map" : item}
             </button>
           ))}
-          <a className="rounded-md px-1 py-3 text-center text-xs text-fog transition hover:bg-pearl/8" href="/lab">
-            Lab
-          </a>
         </div>
       </nav>
     </main>
@@ -3147,14 +3203,22 @@ function Field({
   );
 }
 
-function DepthPicker({ value, onChange }: { value: Depth; onChange: (depth: Depth) => void }) {
+function DepthPicker({
+  value,
+  onChange,
+  showDescriptions = false
+}: {
+  value: Depth;
+  onChange: (depth: Depth) => void;
+  showDescriptions?: boolean;
+}) {
   return (
     <div className="space-y-3">
       <p className="text-base text-fog">How should Clara usually respond?</p>
-      <div className="grid grid-cols-2 gap-2">
+      <div className={showDescriptions ? "grid gap-2" : "grid grid-cols-2 gap-2"}>
         {(["keep_it_light", "go_a_little_deeper"] as Depth[]).map((depth) => (
           <button
-            className={`rounded-md border px-3 py-3 text-sm transition ${
+            className={`rounded-md border px-3 py-3 text-left text-sm transition ${
               value === depth
                 ? "border-clay bg-clay text-ink"
                 : "border-pearl/12 bg-pearl/7 text-fog hover:bg-pearl/10"
@@ -3163,7 +3227,12 @@ function DepthPicker({ value, onChange }: { value: Depth; onChange: (depth: Dept
             onClick={() => onChange(depth)}
             type="button"
           >
-            {engineToDepth(depth)}
+            <span className="block font-medium">{engineToDepth(depth)}</span>
+            {showDescriptions ? (
+              <span className={`mt-1 block leading-5 ${value === depth ? "text-ink/75" : "text-fog/75"}`}>
+                {depthHelperText(depth)}
+              </span>
+            ) : null}
           </button>
         ))}
       </div>
