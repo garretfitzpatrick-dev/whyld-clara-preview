@@ -32,6 +32,8 @@ type TouchpointType =
 type MomentKind = "Before something" | "After something" | "Just noticed something";
 type MeaningNoteConfidence = "low" | "medium" | "high";
 type MeaningNoteMode = "review" | "edit";
+type DecisionFrameType = "life" | "work" | "family" | "goals" | "meeting" | "other";
+type DecisionFrameStatus = "open" | "closed";
 type ResponseStrategy =
   | "acknowledge"
   | "reflect"
@@ -113,6 +115,20 @@ type MeaningNote = {
   confidence: MeaningNoteConfidence;
 };
 
+type DecisionFrame = {
+  id: string;
+  createdAt: string;
+  question: string;
+  decisionType: DecisionFrameType;
+  options: string[];
+  criteria: string[];
+  tradeoffs: string[];
+  nextStep: string | null;
+  status: DecisionFrameStatus;
+  sourceSessionId?: string;
+  sourceTouchpointType?: TouchpointType;
+};
+
 type LegacyEntry = {
   id: string;
   createdAt: string;
@@ -164,6 +180,7 @@ type ClaraLabResponse = {
 
 type UserIntentContext = {
   userIntent: UserIntent;
+  decisionFrame?: DecisionFrame | null;
 };
 
 type MeaningNoteResponse = {
@@ -206,7 +223,8 @@ const STORAGE_KEYS = {
   currentSession: "whyld-world-clara-current-session",
   sessions: "whyld-world-clara-sessions",
   legacyEntries: "whyld-world-clara-entries",
-  meaningNotes: "whyld-world-clara-meaning-notes"
+  meaningNotes: "whyld-world-clara-meaning-notes",
+  decisionFrames: "whyld-world-clara-decision-frames"
 };
 
 const APP_STORAGE_PREFIXES = ["whyld-world-", "whyld-", "clara-"];
@@ -1383,7 +1401,8 @@ async function generateClaraFromConversation(
   const memory = [
     profileMemory(profile, previousSessions),
     sessionTouchpointContext(session),
-    intentContext ? `Detected user intent: ${intentContext.userIntent}` : ""
+    intentContext ? `Detected user intent: ${intentContext.userIntent}` : "",
+    intentContext?.decisionFrame ? decisionFrameMemory(intentContext.decisionFrame) : ""
   ]
     .filter(Boolean)
     .join("\n");
@@ -1394,7 +1413,8 @@ async function generateClaraFromConversation(
       transcript,
       memory,
       depth: session.currentDepth,
-      userIntent: intentContext?.userIntent
+      userIntent: intentContext?.userIntent,
+      decisionFrame: intentContext?.decisionFrame
     });
     const response = await fetch("/api/clara-lab", {
       method: "POST",
@@ -1406,7 +1426,8 @@ async function generateClaraFromConversation(
         transcript,
         memory,
         depth: session.currentDepth,
-        userIntent: intentContext?.userIntent
+        userIntent: intentContext?.userIntent,
+        decisionFrame: intentContext?.decisionFrame
       })
     });
 
@@ -1442,6 +1463,18 @@ function fallbackConversationText(session: CurrentSession) {
 
   if (isCorrectionSignal(latestUser)) {
     return "Right - fair correction. What would be the better way to say it?";
+  }
+
+  if (isDecisionMoment(latestUser)) {
+    const frame = decisionFrameFromText(latestUser, session);
+    const threads = frame.criteria.slice(0, 3).join(", ");
+    const tradeoff = frame.tradeoffs[0];
+
+    if (tradeoff) {
+      return `This sounds like a real ${tradeoff} decision. I'd separate it into ${threads}. Which one feels most important to look at first?`;
+    }
+
+    return `This sounds like a decision with a few moving pieces. I'd start with ${threads}. Which one should we look at first?`;
   }
 
   if (lower.includes("work") && (lower.includes("annoying") || lower.includes("hard"))) {
@@ -1691,6 +1724,175 @@ function fallbackMeaningNoteText(session: CompletedSession) {
   return `${text} seems to be something worth remembering from this ${label}.`;
 }
 
+function isDecisionMoment(text: string) {
+  const lower = text.toLowerCase();
+  return (
+    /\bhow should (i|we) (think|prepare|approach|handle)\b/.test(lower) ||
+    /\bcan you help (me|us) think\b/.test(lower) ||
+    /\bhelp (me|us) think (this|it) through\b/.test(lower) ||
+    /\bshould (i|we)\b/.test(lower) ||
+    /\bwhat should (my|our|i|we)\b/.test(lower) ||
+    /\bwe'?re thinking about moving\b/.test(lower) ||
+    /\bwe are thinking about moving\b/.test(lower) ||
+    /\bi'?m deciding between\b/.test(lower) ||
+    /\bdeciding between\b/.test(lower) ||
+    /\bi don'?t know what to do about\b/.test(lower) ||
+    /\bwhat should my goals be\b/.test(lower) ||
+    /\bhow should i prepare for (this|the|a) meeting\b/.test(lower) ||
+    /\bi'?m trying to choose\b/.test(lower) ||
+    /\btrying to decide\b/.test(lower) ||
+    /\bdecide whether\b/.test(lower) ||
+    /\bthinking about changing jobs\b/.test(lower) ||
+    /\bwhat kind of (parent|leader|creator|partner|person)\b.*\btrying to be\b/.test(lower)
+  );
+}
+
+function decisionFrameFromText(text: string, session: CurrentSession): DecisionFrame {
+  const decisionType = inferDecisionType(text);
+
+  return {
+    id: crypto.randomUUID(),
+    createdAt: new Date().toISOString(),
+    question: decisionQuestionFromText(text),
+    decisionType,
+    options: inferDecisionOptions(text, decisionType),
+    criteria: inferDecisionCriteria(text, decisionType),
+    tradeoffs: inferDecisionTradeoffs(text, decisionType),
+    nextStep: inferDecisionNextStep(text, decisionType),
+    status: "open",
+    sourceSessionId: session.sessionId,
+    sourceTouchpointType: session.touchpointType ?? "daily_check_in"
+  };
+}
+
+function inferDecisionType(text: string): DecisionFrameType {
+  const lower = text.toLowerCase();
+
+  if (/\bmeeting\b/.test(lower)) return "meeting";
+  if (/\bgoal|goals|what kind of\b/.test(lower)) return "goals";
+  if (/\bjob|career|boss|client|work\b/.test(lower)) return "work";
+  if (/\bkids?|children|family|parent|school|teacher|program|coaching\b/.test(lower)) return "family";
+  if (/\bmove|moving|town|city|home\b/.test(lower)) return "life";
+  return "other";
+}
+
+function decisionQuestionFromText(text: string) {
+  return text.trim().replace(/\s+/g, " ").slice(0, 320);
+}
+
+function inferDecisionOptions(text: string, decisionType: DecisionFrameType) {
+  const lower = text.toLowerCase();
+  const between = text.match(/\bbetween\s+(.+?)\s+(?:and|or|vs\.?|versus)\s+(.+?)(?:[.!?]|$)/i);
+  if (between) {
+    return cleanStringList([between[1], between[2]]).map(shortenDecisionItem).slice(0, 4);
+  }
+
+  const whether = text.match(/\bwhether to\s+([^.!?]+)/i);
+  if (whether) {
+    const option = shortenDecisionItem(whether[1]);
+    return cleanStringList([option, `not ${option}`]).slice(0, 2);
+  }
+
+  if (/\bmoving?\b/.test(lower)) return ["stay", "move"];
+  if (/\bchange jobs?\b|\bchanging jobs?\b/.test(lower)) return ["stay in the current job", "change jobs"];
+  if (decisionType === "meeting") return ["prepare the outcome", "prepare the role", "prepare the tone"];
+
+  return [];
+}
+
+function inferDecisionCriteria(text: string, decisionType: DecisionFrameType) {
+  const lower = text.toLowerCase();
+  const criteria: string[] = [];
+
+  if (/\bkids?|children|school|teacher|program|challeng/.test(lower)) {
+    criteria.push("what the kids need now", "what they may need later", "the family life you want to protect");
+  }
+  if (/\bhappy|belong|friends?|town|community\b/.test(lower)) {
+    criteria.push("belonging");
+  }
+  if (/\bjob|career|work|money|salary\b/.test(lower)) {
+    criteria.push("growth", "stability", "money", "family load");
+  }
+  if (decisionType === "meeting") {
+    criteria.push("outcome", "role", "mindset");
+  }
+  if (decisionType === "goals") {
+    criteria.push("attention", "capacity", "what this season is asking for");
+  }
+
+  const fallbackByType: Record<DecisionFrameType, string[]> = {
+    life: ["what matters most", "timing", "cost of staying", "cost of changing"],
+    work: ["growth", "stability", "energy", "family load"],
+    family: ["what the family needs", "belonging", "growth", "stability"],
+    goals: ["attention", "capacity", "season of life"],
+    meeting: ["outcome", "role", "mindset"],
+    other: ["what matters most", "tradeoffs", "timing"]
+  };
+
+  return uniqueStrings([...criteria, ...fallbackByType[decisionType]]).slice(0, 4);
+}
+
+function inferDecisionTradeoffs(text: string, decisionType: DecisionFrameType) {
+  const lower = text.toLowerCase();
+  const tradeoffs: string[] = [];
+
+  if (/\bhappy|belong|community|friends?\b/.test(lower) && /\bchalleng|growth|program|teacher|cut\b/.test(lower)) {
+    tradeoffs.push("belonging vs growth", "current happiness vs future opportunity");
+  }
+  if (/\bmove|moving|stay\b/.test(lower)) {
+    tradeoffs.push("stability vs change");
+  }
+  if (/\bjob|career|work\b/.test(lower)) {
+    tradeoffs.push("growth vs stability", "money vs energy");
+  }
+  if (decisionType === "meeting") {
+    tradeoffs.push("outcome vs relationship", "preparation vs presence");
+  }
+  if (decisionType === "goals") {
+    tradeoffs.push("ambition vs bandwidth", "focus vs possibility");
+  }
+
+  return uniqueStrings(tradeoffs).slice(0, 4);
+}
+
+function inferDecisionNextStep(text: string, decisionType: DecisionFrameType) {
+  if (decisionType === "meeting") return "Name the outcome that would make the meeting worth the time.";
+  if (decisionType === "goals") return "Choose the one area that deserves attention first.";
+  if (inferDecisionOptions(text, decisionType).length > 1) return "Name which option feels most alive or most costly right now.";
+  return "Choose the thread to explore first.";
+}
+
+function shortenDecisionItem(text: string) {
+  return text.trim().replace(/\s+/g, " ").replace(/^whether to\s+/i, "").slice(0, 80);
+}
+
+function uniqueStrings(values: string[]) {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)));
+}
+
+function decisionFrameMemory(frame: DecisionFrame) {
+  const lines = [
+    "Decision Frame v1 is active.",
+    `Decision question: ${frame.question}`,
+    `Decision type: ${frame.decisionType}`,
+    frame.options.length > 0 ? `Possible options: ${frame.options.join(", ")}` : "",
+    frame.criteria.length > 0 ? `Possible criteria or threads: ${frame.criteria.join(", ")}` : "",
+    frame.tradeoffs.length > 0 ? `Possible tradeoffs: ${frame.tradeoffs.join(", ")}` : "",
+    frame.nextStep ? `Possible small next step: ${frame.nextStep}` : "",
+    "Use the frame_decision listening move. Do not decide for the user. Ask which thread they want to explore first."
+  ];
+
+  return lines.filter(Boolean).join("\n");
+}
+
+function sameDecisionFrame(a: DecisionFrame, b: DecisionFrame) {
+  return a.sourceSessionId === b.sourceSessionId && normalizeDecisionQuestion(a.question) === normalizeDecisionQuestion(b.question);
+}
+
+function normalizeDecisionQuestion(text: string) {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
 function cleanStringList(value: unknown) {
   return Array.isArray(value)
     ? Array.from(new Set(value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean)))
@@ -1871,6 +2073,21 @@ function isTouchpointType(value: unknown): value is TouchpointType {
   );
 }
 
+function isDecisionFrameType(value: unknown): value is DecisionFrameType {
+  return (
+    value === "life" ||
+    value === "work" ||
+    value === "family" ||
+    value === "goals" ||
+    value === "meeting" ||
+    value === "other"
+  );
+}
+
+function isDecisionFrameStatus(value: unknown): value is DecisionFrameStatus {
+  return value === "open" || value === "closed";
+}
+
 function isMomentKind(value: unknown): value is MomentKind {
   return value === "Before something" || value === "After something" || value === "Just noticed something";
 }
@@ -1926,6 +2143,24 @@ function isMeaningNote(value: unknown): value is MeaningNote {
     Array.isArray(value.themes) &&
     value.themes.every((item) => typeof item === "string") &&
     (value.confidence === "low" || value.confidence === "medium" || value.confidence === "high")
+  );
+}
+
+function isDecisionFrame(value: unknown): value is DecisionFrame {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.createdAt === "string" &&
+    typeof value.question === "string" &&
+    isDecisionFrameType(value.decisionType) &&
+    Array.isArray(value.options) &&
+    value.options.every((item) => typeof item === "string") &&
+    Array.isArray(value.criteria) &&
+    value.criteria.every((item) => typeof item === "string") &&
+    Array.isArray(value.tradeoffs) &&
+    value.tradeoffs.every((item) => typeof item === "string") &&
+    (value.nextStep === null || typeof value.nextStep === "string") &&
+    isDecisionFrameStatus(value.status)
   );
 }
 
@@ -2043,6 +2278,21 @@ function readMeaningNotesFromStorage(): MeaningNote[] {
   return [];
 }
 
+function readDecisionFramesFromStorage(): DecisionFrame[] {
+  const storedFrames = window.localStorage.getItem(STORAGE_KEYS.decisionFrames);
+  const parsedFrames = parseStoredJson<unknown>(storedFrames);
+
+  if (Array.isArray(parsedFrames)) {
+    return parsedFrames.filter(isDecisionFrame);
+  }
+
+  if (storedFrames) {
+    window.localStorage.removeItem(STORAGE_KEYS.decisionFrames);
+  }
+
+  return [];
+}
+
 function clearPrototypeStorage() {
   Object.values(STORAGE_KEYS).forEach((key) => window.localStorage.removeItem(key));
 
@@ -2096,6 +2346,7 @@ export default function Home() {
   const [currentSession, setCurrentSession] = useState<CurrentSession | null>(null);
   const [sessions, setSessions] = useState<CompletedSession[]>([]);
   const [meaningNotes, setMeaningNotes] = useState<MeaningNote[]>([]);
+  const [decisionFrames, setDecisionFrames] = useState<DecisionFrame[]>([]);
   const [pendingMeaningNote, setPendingMeaningNote] = useState<MeaningNote | null>(null);
   const [meaningNoteDraftText, setMeaningNoteDraftText] = useState("");
   const [meaningNoteMode, setMeaningNoteMode] = useState<MeaningNoteMode>("review");
@@ -2116,6 +2367,7 @@ export default function Home() {
     const parsedSessions = readSessionsFromStorage();
     const parsedSession = readCurrentSessionFromStorage();
     const parsedMeaningNotes = readMeaningNotesFromStorage();
+    const parsedDecisionFrames = readDecisionFramesFromStorage();
 
     if (parsedProfile) {
       setProfile(parsedProfile);
@@ -2125,6 +2377,7 @@ export default function Home() {
 
     setSessions(parsedSessions);
     setMeaningNotes(parsedMeaningNotes);
+    setDecisionFrames(parsedDecisionFrames);
 
     if (parsedSession) {
       if (parsedSession.status === "active" && isToday(parsedSession.startedAt)) {
@@ -2150,6 +2403,12 @@ export default function Home() {
       window.localStorage.setItem(STORAGE_KEYS.meaningNotes, JSON.stringify(meaningNotes));
     }
   }, [meaningNotes, ready]);
+
+  useEffect(() => {
+    if (ready) {
+      window.localStorage.setItem(STORAGE_KEYS.decisionFrames, JSON.stringify(decisionFrames));
+    }
+  }, [decisionFrames, ready]);
 
   useEffect(() => {
     if (!ready) return;
@@ -2267,6 +2526,14 @@ export default function Home() {
       ...withDepthState(currentSession, trimmed),
       messages: [...currentSession.messages, userMessage]
     };
+    const decisionFrame = isDecisionMoment(trimmed) ? decisionFrameFromText(trimmed, sessionWithReply) : null;
+
+    if (decisionFrame) {
+      console.log("Decision Frame detected", decisionFrame);
+      setDecisionFrames((current) =>
+        current.some((frame) => sameDecisionFrame(frame, decisionFrame)) ? current : [decisionFrame, ...current]
+      );
+    }
 
     if (shouldCloseForDepth(sessionWithReply, trimmed)) {
       await closeSession(trimmed, "That's a good place to leave it for today.");
@@ -2283,7 +2550,8 @@ export default function Home() {
         threadCorrectionOffered: true
       };
       const claraResult = await generateClaraFromConversation(redirectedSession, profile, sessions, {
-        userIntent: detectedUserIntent
+        userIntent: detectedUserIntent,
+        decisionFrame
       });
       setCurrentSession(maybeApplyDepthCheck({
         ...redirectedSession,
@@ -2301,7 +2569,8 @@ export default function Home() {
 
     if (isThreadCorrectionChoice && (normalizeChoice(trimmed) === "yes, that" || normalizeChoice(trimmed) === "yes that")) {
       const claraResult = await generateClaraFromConversation(sessionWithReply, profile, sessions, {
-        userIntent: detectedUserIntent
+        userIntent: detectedUserIntent,
+        decisionFrame
       });
       setCurrentSession(maybeApplyDepthCheck({
         ...sessionWithReply,
@@ -2319,7 +2588,8 @@ export default function Home() {
     }
 
     const claraResult = await generateClaraFromConversation(sessionWithReply, profile, sessions, {
-      userIntent: detectedUserIntent
+      userIntent: detectedUserIntent,
+      decisionFrame
     });
     setCurrentSession(
       maybeApplyDepthCheck({
@@ -2614,6 +2884,18 @@ export default function Home() {
     setMeaningNoteDraftText("");
     setMeaningNoteMode("review");
     setMeaningNoteError("");
+  }
+
+  function toggleDecisionFrameStatus(id: string) {
+    setDecisionFrames((current) =>
+      current.map((frame) =>
+        frame.id === id ? { ...frame, status: frame.status === "open" ? "closed" : "open" } : frame
+      )
+    );
+  }
+
+  function updateDecisionFrame(id: string, updates: Partial<DecisionFrame>) {
+    setDecisionFrames((current) => current.map((frame) => (frame.id === id ? { ...frame, ...updates } : frame)));
   }
 
   function updateDepth(depth: Depth) {
@@ -3012,11 +3294,38 @@ export default function Home() {
       {tab === "Meaning" && (
         <section className="space-y-5">
           <ViewTitle eyebrow="Meaning Map" title="What your moments are becoming." />
-          {meaningNotes.length === 0 ? (
-            <EmptyState text="Saved Meaning Notes will gather here after you finish a check-in or moment." />
-          ) : (
-            meaningNotes.map((note) => <MeaningNoteCard note={note} key={note.id} />)
-          )}
+          <section className="space-y-5">
+            <div className="space-y-1">
+              <p className="text-sm uppercase tracking-[0.2em] text-clay">Meaning Notes</p>
+              <p className="text-base leading-6 text-fog">Small pieces Clara has helped save from your check-ins.</p>
+            </div>
+            {meaningNotes.length === 0 ? (
+              <EmptyState text="Saved Meaning Notes will gather here after you finish a check-in or moment." />
+            ) : (
+              meaningNotes.map((note) => <MeaningNoteCard note={note} key={note.id} />)
+            )}
+          </section>
+
+          <section className="space-y-5 border-t border-pearl/10 pt-6">
+            <div className="space-y-1">
+              <p className="text-sm uppercase tracking-[0.2em] text-clay">Decision Frames</p>
+              <p className="text-base leading-6 text-fog">
+                Messy questions Clara has helped frame without deciding for you.
+              </p>
+            </div>
+            {decisionFrames.length === 0 ? (
+              <EmptyState text="Decision Frames will appear here when a check-in turns into a question to think through." />
+            ) : (
+              decisionFrames.map((frame) => (
+                <DecisionFrameCard
+                  frame={frame}
+                  key={frame.id}
+                  onToggleStatus={toggleDecisionFrameStatus}
+                  onUpdate={updateDecisionFrame}
+                />
+              ))
+            )}
+          </section>
         </section>
       )}
 
@@ -3311,6 +3620,152 @@ function MeaningNoteCard({ note }: { note: MeaningNote }) {
       ) : null}
     </article>
   );
+}
+
+function DecisionFrameCard({
+  frame,
+  onToggleStatus,
+  onUpdate
+}: {
+  frame: DecisionFrame;
+  onToggleStatus: (id: string) => void;
+  onUpdate: (id: string, updates: Partial<DecisionFrame>) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [question, setQuestion] = useState(frame.question);
+  const [options, setOptions] = useState(frame.options.join(", "));
+  const [criteria, setCriteria] = useState(frame.criteria.join(", "));
+  const [tradeoffs, setTradeoffs] = useState(frame.tradeoffs.join(", "));
+  const [nextStep, setNextStep] = useState(frame.nextStep ?? "");
+
+  function cancelEdit() {
+    setQuestion(frame.question);
+    setOptions(frame.options.join(", "));
+    setCriteria(frame.criteria.join(", "));
+    setTradeoffs(frame.tradeoffs.join(", "));
+    setNextStep(frame.nextStep ?? "");
+    setEditing(false);
+  }
+
+  function saveEdit() {
+    onUpdate(frame.id, {
+      question: question.trim() || frame.question,
+      options: commaList(options),
+      criteria: commaList(criteria),
+      tradeoffs: commaList(tradeoffs),
+      nextStep: nextStep.trim() || null
+    });
+    setEditing(false);
+  }
+
+  return (
+    <article className="space-y-4 border-t border-pearl/10 pt-5">
+      <div className="flex items-center justify-between gap-4 text-sm text-fog">
+        <span>{formatDate(frame.createdAt)}</span>
+        <span>{frame.status}</span>
+      </div>
+      <p className="text-sm uppercase tracking-[0.18em] text-clay">{formatDecisionType(frame.decisionType)} Frame</p>
+      {editing ? (
+        <div className="space-y-3">
+          <label className="block space-y-2">
+            <span className="text-sm text-clay">Question</span>
+            <textarea
+              className="min-h-28 w-full resize-none rounded-md border border-pearl/12 bg-ink/55 px-4 py-3 text-lg leading-7 text-pearl outline-none transition focus:border-clay/70"
+              value={question}
+              onChange={(event) => setQuestion(event.target.value)}
+            />
+          </label>
+          <MiniField label="Options" value={options} onChange={setOptions} />
+          <MiniField label="Threads" value={criteria} onChange={setCriteria} />
+          <MiniField label="Tradeoffs" value={tradeoffs} onChange={setTradeoffs} />
+          <MiniField label="Next step" value={nextStep} onChange={setNextStep} />
+          <div className="flex flex-wrap gap-2">
+            <button
+              className="rounded-md bg-clay px-4 py-3 text-sm font-medium text-ink transition hover:bg-[#cc9978]"
+              onClick={saveEdit}
+              type="button"
+            >
+              Save
+            </button>
+            <button
+              className="rounded-md border border-pearl/12 bg-pearl/7 px-4 py-3 text-sm text-fog transition hover:bg-pearl/10"
+              onClick={cancelEdit}
+              type="button"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <p className="text-xl leading-8 text-pearl">{frame.question}</p>
+          {frame.tradeoffs.length > 0 ? (
+            <div className="space-y-2">
+              <p className="text-sm text-clay">Key tradeoffs</p>
+              <TagList values={frame.tradeoffs} />
+            </div>
+          ) : null}
+          {frame.criteria.length > 0 ? (
+            <div className="space-y-2">
+              <p className="text-sm text-clay">Threads</p>
+              <TagList values={frame.criteria} />
+            </div>
+          ) : null}
+          {frame.nextStep ? (
+            <div className="space-y-1">
+              <p className="text-sm text-clay">Next step</p>
+              <p className="text-lg leading-7 text-fog">{frame.nextStep}</p>
+            </div>
+          ) : null}
+          <div className="flex flex-wrap gap-2">
+            <button
+              className="rounded-md border border-pearl/12 bg-pearl/7 px-4 py-3 text-sm text-fog transition hover:bg-pearl/10"
+              onClick={() => setEditing(true)}
+              type="button"
+            >
+              Edit
+            </button>
+            <button
+              className="rounded-md border border-pearl/12 bg-pearl/7 px-4 py-3 text-sm text-fog transition hover:bg-pearl/10"
+              onClick={() => onToggleStatus(frame.id)}
+              type="button"
+            >
+              Mark {frame.status === "open" ? "closed" : "open"}
+            </button>
+          </div>
+        </>
+      )}
+    </article>
+  );
+}
+
+function formatDecisionType(type: DecisionFrameType) {
+  return capitalize(type);
+}
+
+function MiniField({
+  label,
+  value,
+  onChange
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="block space-y-2">
+      <span className="text-sm text-clay">{label}</span>
+      <input
+        className="w-full rounded-md border border-pearl/12 bg-ink/55 px-4 py-3 text-base text-pearl outline-none transition placeholder:text-fog/45 focus:border-clay/70"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    </label>
+  );
+}
+
+function commaList(text: string) {
+  return uniqueStrings(text.split(",").map((item) => item.trim())).slice(0, 6);
 }
 
 function TagRow({ tags }: { tags: ThemeTag[] }) {

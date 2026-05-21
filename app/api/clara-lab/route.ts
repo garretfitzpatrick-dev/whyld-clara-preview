@@ -13,9 +13,19 @@ type LabRequest = {
   memory?: string;
   depth?: string;
   userIntent?: UserIntent;
+  decisionFrame?: DecisionFramePayload;
   model?: string;
   temperature?: number;
   maxTokens?: number;
+};
+
+type DecisionFramePayload = {
+  question?: string;
+  decisionType?: string;
+  options?: string[];
+  criteria?: string[];
+  tradeoffs?: string[];
+  nextStep?: string | null;
 };
 
 export async function POST(request: Request) {
@@ -34,11 +44,12 @@ export async function POST(request: Request) {
   const memory = body.memory?.trim() ?? "";
   const depth = body.depth?.trim() ?? "";
   const userIntent = isUserIntent(body.userIntent) ? body.userIntent : detectUserIntentFromTranscript(transcript);
+  const decisionFrame = isDecisionFramePayload(body.decisionFrame) ? body.decisionFrame : null;
   const model = body.model?.trim() || CLARA_MODEL;
   const temperature = clampNumber(body.temperature, 0, 2, CLARA_DEFAULT_TEMPERATURE);
   const maxTokens = Math.round(clampNumber(body.maxTokens, 40, 800, CLARA_DEFAULT_MAX_TOKENS));
-  const responseGuidance = buildResponseGuidance(transcript, userIntent, depth);
-  const userPrompt = buildLabUserPrompt({ task, transcript, opener, memory, depth, responseGuidance });
+  const responseGuidance = buildResponseGuidance(transcript, userIntent, depth, memory, decisionFrame);
+  const userPrompt = buildLabUserPrompt({ task, transcript, opener, memory, depth, responseGuidance, decisionFrame });
   const debugPrompt = {
     model,
     temperature,
@@ -120,9 +131,11 @@ function buildLabUserPrompt({
   opener,
   memory,
   depth,
-  responseGuidance
+  responseGuidance,
+  decisionFrame
 }: Pick<Required<LabRequest>, "task" | "transcript" | "opener" | "memory" | "depth"> & {
   responseGuidance: ResponseGuidance;
+  decisionFrame: DecisionFramePayload | null;
 }) {
   return JSON.stringify(
     {
@@ -131,6 +144,7 @@ function buildLabUserPrompt({
       memory,
       depth,
       responseGuidance,
+      decisionFrame,
       transcript
     },
     null,
@@ -146,25 +160,34 @@ type UserIntent =
   | "correction"
   | "explicit_stop";
 
-type ResponseMove = "reflect_only" | "gentle_question" | "witness" | "save" | "close" | "continue";
+type ResponseMove = "reflect_only" | "gentle_question" | "witness" | "save" | "close" | "continue" | "frame_decision";
 
 type ResponseGuidance = {
   suggestedMove: ResponseMove;
   latestUserText: string;
   userIntent: UserIntent;
   seriousLifeEvent: boolean;
+  decisionMoment: boolean;
   continueRequested: boolean;
   recentQuestionLedReplies: number;
   instructions: string[];
 };
 
-function buildResponseGuidance(transcript: string, userIntent: UserIntent, depth: string): ResponseGuidance {
+function buildResponseGuidance(
+  transcript: string,
+  userIntent: UserIntent,
+  depth: string,
+  memory: string,
+  decisionFrame: DecisionFramePayload | null
+): ResponseGuidance {
   const latestUserText = latestUserLine(transcript);
   const seriousLifeEvent = isSeriousLifeEvent(latestUserText);
+  const decisionMoment =
+    decisionFrame !== null || isDecisionMoment(latestUserText) || memory.toLowerCase().includes("decision frame v1");
   const continueRequested = userIntent === "explicit_continue" || isContinueSignal(latestUserText);
   const recentQuestionLedReplies = countRecentQuestionLedClaraReplies(transcript);
   const instructions: string[] = [
-    "Use one of these response moves: reflect_only, gentle_question, witness, save, close, continue.",
+    "Use one of these response moves: reflect_only, gentle_question, witness, save, close, continue, frame_decision.",
     "Do not ask more than two question-led Clara responses in a row.",
     "A response may have no question.",
     `Detected userIntent: ${userIntent}. Use it as conversational pragmatics, not user-facing text.`
@@ -181,6 +204,16 @@ function buildResponseGuidance(transcript: string, userIntent: UserIntent, depth
       "Do not use generic flow-control language.",
       "Do not ask whether the user wants to stay with this.",
       "Do not rush to save or close."
+    );
+  } else if (decisionMoment) {
+    suggestedMove = "frame_decision";
+    instructions.push(
+      "Decision/framing moment detected. Do not decide for the user.",
+      "Briefly acknowledge the human weight of the question.",
+      "Name the structure of the decision in plain language.",
+      "Identify 2-4 threads, criteria, tradeoffs, or time horizons.",
+      "Ask which thread the user wants to look at first.",
+      "Do not become a pros/cons bot, force a matrix, sound like a consultant, or recommend an option."
     );
   } else if (continueRequested) {
     suggestedMove = "continue";
@@ -218,10 +251,19 @@ function buildResponseGuidance(transcript: string, userIntent: UserIntent, depth
     latestUserText,
     userIntent,
     seriousLifeEvent,
+    decisionMoment,
     continueRequested,
     recentQuestionLedReplies,
     instructions
   };
+}
+
+function isDecisionFramePayload(value: unknown): value is DecisionFramePayload {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    ("question" in value || "decisionType" in value || "criteria" in value || "tradeoffs" in value)
+  );
 }
 
 function detectUserIntentFromTranscript(transcript: string): UserIntent {
@@ -312,6 +354,29 @@ function isCorrectionSignal(text: string) {
     /^no[, ]/.test(lower) ||
     /\bno,? actually\b/.test(lower) ||
     /\bactually\b/.test(lower)
+  );
+}
+
+function isDecisionMoment(text: string) {
+  const lower = text.toLowerCase();
+  return (
+    /\bhow should (i|we) (think|prepare|approach|handle)\b/.test(lower) ||
+    /\bcan you help (me|us) think\b/.test(lower) ||
+    /\bhelp (me|us) think (this|it) through\b/.test(lower) ||
+    /\bshould (i|we)\b/.test(lower) ||
+    /\bwhat should (my|our|i|we)\b/.test(lower) ||
+    /\bwe'?re thinking about moving\b/.test(lower) ||
+    /\bwe are thinking about moving\b/.test(lower) ||
+    /\bi'?m deciding between\b/.test(lower) ||
+    /\bdeciding between\b/.test(lower) ||
+    /\bi don'?t know what to do about\b/.test(lower) ||
+    /\bwhat should my goals be\b/.test(lower) ||
+    /\bhow should i prepare for (this|the|a) meeting\b/.test(lower) ||
+    /\bi'?m trying to choose\b/.test(lower) ||
+    /\btrying to decide\b/.test(lower) ||
+    /\bdecide whether\b/.test(lower) ||
+    /\bthinking about changing jobs\b/.test(lower) ||
+    /\bwhat kind of (parent|leader|creator|partner|person)\b.*\btrying to be\b/.test(lower)
   );
 }
 
