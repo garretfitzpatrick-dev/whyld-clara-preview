@@ -25,6 +25,7 @@ type DecisionFramePayload = {
   decisionType?: string;
   status?: string;
   stage?: string;
+  currentDecisionMode?: string;
   frameSummary?: string;
   threads?: string[];
   criteria?: string[];
@@ -32,6 +33,8 @@ type DecisionFramePayload = {
   knowns?: string[];
   unknowns?: string[];
   possiblePaths?: string[];
+  optionNotes?: string[];
+  comparisonNotes?: string[];
   currentFocus?: string | null;
   nextStep?: string | null;
 };
@@ -43,10 +46,13 @@ type DecisionFrameUpdatePayload = {
   knowns?: string[];
   unknowns?: string[];
   possiblePaths?: string[];
+  optionNotes?: string[];
+  comparisonNotes?: string[];
   currentFocus?: string | null;
   nextStep?: string | null;
   frameSummary?: string | null;
   stage?: string | null;
+  currentDecisionMode?: string | null;
 };
 
 export async function POST(request: Request) {
@@ -221,6 +227,7 @@ function buildResponseGuidance(
   const seriousLifeEvent = isSeriousLifeEvent(latestUserText);
   const decisionMoment =
     decisionFrame !== null || isDecisionMoment(latestUserText) || memory.toLowerCase().includes("decision frame v1");
+  const decisionMode = decisionFrame?.currentDecisionMode;
   const continueRequested = userIntent === "explicit_continue" || isContinueSignal(latestUserText);
   const recentQuestionLedReplies = countRecentQuestionLedClaraReplies(transcript);
   const instructions: string[] = [
@@ -251,6 +258,7 @@ function buildResponseGuidance(
   } else if (decisionMoment) {
     suggestedMove = "frame_decision";
     instructions.push(
+      ...[
       "Decision/framing moment detected. Do not decide for the user.",
       "Briefly acknowledge the human weight of the question.",
       "Name the structure of the decision in plain language.",
@@ -260,10 +268,26 @@ function buildResponseGuidance(
       "Use this rhythm: say what the user added to the frame, briefly say why it matters, then ask the next useful question or offer to pause.",
       "Use progress feedback such as 'I'd put that under what matters,' 'That seems like one of the big tensions,' or 'That gives the frame a clearer shape.'",
       "If the frame is in next_step stage, help name one small next honest step instead of asking more broad questions.",
+      "Decision-thinking modes are available: reflect clarifies what matters; map names possible paths; research names facts and unknowns; compare puts paths against criteria; act identifies one next honest step.",
+      decisionMode ? `Current decision-thinking mode: ${decisionMode}. Use that kind of thinking for this response.` : "",
+      decisionMode === "map"
+        ? "Map mode: help name possible paths or options. If the user asks for ideas, offer a bounded set as possibilities, not advice."
+        : "",
+      decisionMode === "research"
+        ? "Research mode: focus on unknowns and facts to gather. It is okay to say this may need facts, not more reflection."
+        : "",
+      decisionMode === "compare"
+        ? "Compare mode: compare paths against what matters. Do not score, rank, or recommend."
+        : "",
+      decisionMode === "act" ? "Act mode: help name one small next honest step that creates more clarity." : "",
+      asksForDecisionIdeas(latestUserText)
+        ? "The user is asking for ideas/options/research. Shift toward Map or Research, not another feelings-based question."
+        : "",
       "Ask which thread the user wants to look at first.",
       "Tie the question to one visible part of the frame.",
       "Do not become a pros/cons bot, force a matrix, sound like a consultant, or recommend an option.",
       "Avoid phrases like decision analysis, optimization, weighted criteria, matrix, or score."
+      ].filter(Boolean)
     );
   } else if (continueRequested) {
     suggestedMove = "continue";
@@ -318,11 +342,14 @@ function isDecisionFramePayload(value: unknown): value is DecisionFramePayload {
     ("question" in value ||
       "decisionType" in value ||
       "stage" in value ||
+      "currentDecisionMode" in value ||
       "frameSummary" in value ||
       "threads" in value ||
       "criteria" in value ||
       "tradeoffs" in value ||
-      "possiblePaths" in value)
+      "possiblePaths" in value ||
+      "optionNotes" in value ||
+      "comparisonNotes" in value)
   );
 }
 
@@ -336,10 +363,13 @@ function isDecisionFrameUpdatePayload(value: unknown): value is DecisionFrameUpd
       "knowns" in value ||
       "unknowns" in value ||
       "possiblePaths" in value ||
+      "optionNotes" in value ||
+      "comparisonNotes" in value ||
       "currentFocus" in value ||
       "nextStep" in value ||
       "frameSummary" in value ||
-      "stage" in value)
+      "stage" in value ||
+      "currentDecisionMode" in value)
   );
 }
 
@@ -400,7 +430,20 @@ function countRecentQuestionLedClaraReplies(transcript: string) {
 }
 
 function isContinueSignal(text: string) {
-  return ["keep going", "continue", "say more", "go deeper"].includes(text.trim().toLowerCase());
+  return ["keep going", "continue", "say more", "go deeper", "keep working it"].includes(text.trim().toLowerCase());
+}
+
+function asksForDecisionIdeas(text: string) {
+  const lower = text.toLowerCase();
+
+  return (
+    /\bi don'?t know\b/.test(lower) ||
+    /\bdo you have any ideas\b/.test(lower) ||
+    /\bwhat are my options\b/.test(lower) ||
+    /\bhow would i figure this out\b/.test(lower) ||
+    /\bwhat should i research\b/.test(lower) ||
+    /\bwhat do i need to find out\b/.test(lower)
+  );
 }
 
 function isAcknowledgement(text: string) {
