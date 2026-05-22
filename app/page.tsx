@@ -15,6 +15,7 @@ type SessionStatus = "active" | "closed";
 type ExpectedInput = "choice" | "text" | "none";
 type ThreadSource = "clara" | "user";
 type UserDepthSignal = "low" | "medium" | "high";
+type ConversationRoute = "moment" | "decision" | "unclear";
 type UserIntent =
   | "substantive_response"
   | "acknowledgement"
@@ -97,6 +98,9 @@ type CurrentSession = {
   touchpointType?: TouchpointType;
   momentKind?: MomentKind;
   eventType?: string;
+  conversationRoute: ConversationRoute;
+  activeDecisionFrameId: string | null;
+  awaitingRouteChoice: boolean;
 };
 
 type CompletedSession = CurrentSession & {
@@ -133,6 +137,7 @@ type DecisionFrame = {
   currentFocus: string | null;
   nextStep: string | null;
   sourceSessionId: string | null;
+  sourceSummary: string | null;
 };
 
 type DecisionFrameUpdate = {
@@ -520,7 +525,10 @@ function createSession(
     turnCount: 0,
     userDepthSignal: "low",
     touchpointType: options.touchpointType ?? "daily_check_in",
-    momentKind: options.momentKind
+    momentKind: options.momentKind,
+    conversationRoute: "moment",
+    activeDecisionFrameId: null,
+    awaitingRouteChoice: false
   };
 }
 
@@ -1139,6 +1147,7 @@ function detectContextualYesNoIntent(text: string, session: CurrentSession): Use
   if (isYesSignal(text)) {
     const askedToSave = claraAskedToSave(lower);
     const askedToContinue = claraAskedToContinue(lower);
+    if (claraAskedToFrameDecision(lower)) return "confirm";
     if (askedToSave && askedToContinue) return "ambiguous_response";
     if (askedToSave) return "save";
     if (askedToContinue) return "explicit_continue";
@@ -1150,6 +1159,7 @@ function detectContextualYesNoIntent(text: string, session: CurrentSession): Use
   const askedToSave = claraAskedToSave(lower);
   const askedToContinue = claraAskedToContinue(lower);
   if (askedToSave && askedToContinue) return "ambiguous_response";
+  if (claraAskedToFrameDecision(lower)) return "correction";
   if (askedToContinue) return "explicit_stop";
   if (askedToSave) return "explicit_continue";
   if (claraAskedForConfirmation(lower)) return "correction";
@@ -1165,12 +1175,29 @@ function isNoSignal(text: string) {
   return ["no", "nope", "nah", "not really"].includes(normalizeConversationalSignal(text));
 }
 
+function isReflectRouteChoice(text: string) {
+  return normalizeChoice(text) === "reflect on it";
+}
+
+function isThinkRouteChoice(text: string) {
+  return normalizeChoice(text) === "think it through";
+}
+
 function claraAskedToSave(text: string) {
   return /\bsave\b/.test(text) || /\bkeep this\b/.test(text);
 }
 
 function claraAskedToContinue(text: string) {
   return /\bkeep going\b/.test(text) || /\bcontinue\b/.test(text) || /\bstay with\b/.test(text) || /\bgo deeper\b/.test(text);
+}
+
+function claraAskedToFrameDecision(text: string) {
+  return (
+    /\bdecision to frame\b/.test(text) ||
+    /\bput the pieces on the table\b/.test(text) ||
+    /\bhelp frame it\b/.test(text) ||
+    /\bthink it through\b/.test(text)
+  );
 }
 
 function claraAskedForConfirmation(text: string) {
@@ -1207,7 +1234,10 @@ function emptyIntentSession(): CurrentSession {
     threadCorrectionOffered: false,
     turnCount: 0,
     userDepthSignal: "low",
-    touchpointType: "daily_check_in"
+    touchpointType: "daily_check_in",
+    conversationRoute: "moment",
+    activeDecisionFrameId: null,
+    awaitingRouteChoice: false
   };
 }
 
@@ -1851,7 +1881,7 @@ function decisionFrameFromText(text: string, session: CurrentSession): DecisionF
     id: crypto.randomUUID(),
     createdAt,
     updatedAt: createdAt,
-    question: decisionQuestionFromText(text),
+    question: inferDecisionQuestion(text, decisionType),
     decisionType,
     status: "open",
     threads,
@@ -1861,7 +1891,8 @@ function decisionFrameFromText(text: string, session: CurrentSession): DecisionF
     unknowns,
     currentFocus,
     nextStep: inferDecisionNextStep(text, decisionType, tradeoffs),
-    sourceSessionId: session.sessionId
+    sourceSessionId: session.sessionId,
+    sourceSummary: summarizeDecisionSource(session, text)
   };
 }
 
@@ -1878,6 +1909,23 @@ function inferDecisionType(text: string): DecisionFrameType {
 
 function decisionQuestionFromText(text: string) {
   return text.trim().replace(/\s+/g, " ").slice(0, 320);
+}
+
+function inferDecisionQuestion(text: string, decisionType: DecisionFrameType) {
+  const explicitQuestion = text.match(/([^.!?]*\?)/);
+  if (explicitQuestion) return decisionQuestionFromText(explicitQuestion[1]);
+
+  const lower = text.toLowerCase();
+  if (decisionType === "family" && /\bmove|moving|school|kids?|children\b/.test(lower)) {
+    return "Should we consider moving because of the school situation?";
+  }
+  if (decisionType === "work" && /\bjob|career|change jobs?|changing jobs?\b/.test(lower)) {
+    return "Should I consider changing jobs?";
+  }
+  if (decisionType === "meeting") return "How should I prepare for this meeting?";
+  if (decisionType === "goals") return "What should my goals be right now?";
+
+  return decisionQuestionFromText(text);
 }
 
 function inferDecisionOptions(text: string, decisionType: DecisionFrameType) {
@@ -1910,13 +1958,13 @@ function inferDecisionThreads(
   const threads: string[] = [];
 
   if (/\bkids?|children|school|teacher|program|challeng/.test(lower)) {
-    threads.push("kids' happiness now", "academic challenge", "what they may need later");
+    threads.push("kids are happy where they are", "kids may not be challenged enough", "what they may need later");
   }
   if (/\bbudget cuts?|programs? .*\bcut|teachers? .*\bcut\b/.test(lower)) {
-    threads.push("future school cuts");
+    threads.push("school budget cuts may affect programs and teachers");
   }
   if (/\bmove|moving|town|home|community|friends?\b/.test(lower)) {
-    threads.push("belonging where you are", "cost of moving");
+    threads.push("moving would disrupt family or community life", "cost of moving");
   }
   if (/\bjob|career|work\b/.test(lower)) {
     threads.push("growth", "stability", "energy", "family load");
@@ -1971,7 +2019,7 @@ function inferDecisionTradeoffs(text: string, decisionType: DecisionFrameType) {
     tradeoffs.push("belonging vs growth", "current happiness vs future opportunity");
   }
   if (/\bmove|moving|stay\b/.test(lower)) {
-    tradeoffs.push("stability vs change");
+    tradeoffs.push("stability vs opportunity", "staying and advocating vs leaving");
   }
   if (/\bjob|career|work\b/.test(lower)) {
     tradeoffs.push("growth vs stability", "money vs energy");
@@ -2011,9 +2059,12 @@ function inferDecisionUnknowns(text: string, decisionType: DecisionFrameType) {
 
   if (/\bchalleng|academic|school\b/.test(lower)) unknowns.push("whether the current environment will stretch them enough");
   if (/\bbudget cuts?|programs? .*\bcut|teachers? .*\bcut\b/.test(lower)) {
-    unknowns.push("what the cuts will actually change");
+    unknowns.push("how deeply the cuts will affect the kids");
   }
-  if (/\bmove|moving|town|home|community|friends?\b/.test(lower)) unknowns.push("what moving would cost socially");
+  if (/\benrichment|challenge|challenged|academic\b/.test(lower)) unknowns.push("whether enrichment could solve part of the problem");
+  if (/\bmove|moving|town|home|community|friends?\b/.test(lower)) {
+    unknowns.push("what moving would cost emotionally, financially, and socially");
+  }
   if (/\bjob|career|work\b/.test(lower)) unknowns.push("what the change would ask from your energy and family life");
   if (decisionType === "meeting") unknowns.push("what outcome would make the meeting worth it");
   if (decisionType === "goals") unknowns.push("what has enough room to matter right now");
@@ -2138,6 +2189,11 @@ function inferDecisionFrameUpdate(text: string, frame: DecisionFrame): DecisionF
   };
 }
 
+function summarizeDecisionSource(session: CurrentSession, latestText?: string) {
+  const text = [sessionText(session), latestText ?? ""].filter(Boolean).join(" ").trim();
+  return text ? text.replace(/\s+/g, " ").slice(0, 420) : null;
+}
+
 function applyDecisionFrameUpdate(frame: DecisionFrame, update: DecisionFrameUpdate): DecisionFrame {
   return {
     ...frame,
@@ -2149,6 +2205,14 @@ function applyDecisionFrameUpdate(frame: DecisionFrame, update: DecisionFrameUpd
     unknowns: uniqueStrings([...frame.unknowns, ...update.unknowns]).slice(0, 8),
     currentFocus: update.currentFocus ?? frame.currentFocus,
     nextStep: update.nextStep ?? frame.nextStep
+  };
+}
+
+function updateDecisionFrameSourceSummary(frame: DecisionFrame, session: CurrentSession, latestText: string) {
+  return {
+    ...frame,
+    updatedAt: new Date().toISOString(),
+    sourceSummary: summarizeDecisionSource(session, latestText)
   };
 }
 
@@ -2177,6 +2241,41 @@ function hasDecisionFrameUpdate(update: DecisionFrameUpdate) {
 
 function isLowSignalFrameReply(text: string) {
   return isYesSignal(text) || isNoSignal(text) || isAcknowledgement(text) || isContinueSignal(text);
+}
+
+function routeConversationMessage(text: string, session: CurrentSession, activeFrame: DecisionFrame | null): ConversationRoute {
+  if (session.conversationRoute === "decision" || activeFrame) return "decision";
+  if (isDecisionMoment(text) || hasStrongDecisionContent(text)) return "decision";
+  if (hasUnclearDecisionContent(text)) return "unclear";
+  return "moment";
+}
+
+function hasStrongDecisionContent(text: string) {
+  const lower = text.toLowerCase();
+  const hasOptions = /\bbetween\b.+\b(and|or|vs\.?|versus)\b/.test(lower) || /\beither\b.+\bor\b/.test(lower);
+  const hasDecisionDomain = /\b(move|moving|school|teacher|program|job|career|meeting|goals?|kids?|children|family)\b/.test(lower);
+  const hasUncertainty = /\b(trying to decide|decide|choice|choose|not sure|unsure|don'?t know what to do|worry|worried)\b/.test(lower);
+  const hasTradeoff = /\b(tradeoff|trade-off|tension|balance|but|however|versus|vs\.?|competing)\b/.test(lower);
+  const hasFutureStakes = /\b(future|later|long term|long-term|consequence|impact|affect|cuts?|moving|change)\b/.test(lower);
+
+  return hasOptions || (hasDecisionDomain && hasUncertainty) || (hasDecisionDomain && hasTradeoff && hasFutureStakes);
+}
+
+function hasUnclearDecisionContent(text: string) {
+  const lower = text.toLowerCase();
+  const hasTension = /\b(but|however|on the other hand|balance|tension|tradeoff|trade-off|competing)\b/.test(lower);
+  const hasUncertainty = /\b(not sure|unsure|don'?t know|wondering|trying to figure out|worry|worried)\b/.test(lower);
+  const hasFuture = /\b(future|later|next|long term|long-term|could|might|may|what if)\b/.test(lower);
+
+  return (hasTension && hasUncertainty) || (hasUncertainty && hasFuture);
+}
+
+function routeChoiceText(route: ConversationRoute) {
+  if (route === "decision") {
+    return "That sounds less like a moment to save and more like a decision to frame. Want to put the pieces on the table?";
+  }
+
+  return "Is this something you mostly want to reflect on, or a decision you're trying to think through?";
 }
 
 function decisionFrameUpdateMemory(update: DecisionFrameUpdate) {
@@ -2210,6 +2309,7 @@ function decisionFrameMemory(frame: DecisionFrame) {
     frame.knowns.length > 0 ? `What seems clear: ${frame.knowns.join(", ")}` : "",
     frame.unknowns.length > 0 ? `What we still don't know: ${frame.unknowns.join(", ")}` : "",
     frame.nextStep ? `Next honest step: ${frame.nextStep}` : "",
+    frame.sourceSummary ? `Source conversation summary: ${frame.sourceSummary}` : "",
     "Use the frame_decision listening move. Do not decide for the user.",
     "Each question should connect to one part of the frame: what's involved, a tension, what matters, an unknown, or the next honest step."
   ];
@@ -2223,7 +2323,26 @@ function sameDecisionFrame(a: DecisionFrame, b: DecisionFrame) {
 
 function activeDecisionFrameForSession(frames: DecisionFrame[], session: CurrentSession | null) {
   if (!session) return null;
+  if (session.activeDecisionFrameId) {
+    return frames.find((frame) => frame.id === session.activeDecisionFrameId && frame.status === "open") ?? null;
+  }
+
   return frames.find((frame) => frame.sourceSessionId === session.sessionId && frame.status === "open") ?? null;
+}
+
+function latestSubstantiveUserText(session: CurrentSession) {
+  return (
+    [...session.messages]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "user" &&
+          !isMomentKind(message.text) &&
+          !isReflectRouteChoice(message.text) &&
+          !isThinkRouteChoice(message.text) &&
+          !isAcknowledgement(message.text)
+      )?.text ?? ""
+  );
 }
 
 function shouldUpdateDecisionFrameFromIntent(intent: UserIntent) {
@@ -2429,6 +2548,10 @@ function isDecisionFrameStatus(value: unknown): value is DecisionFrameStatus {
   return value === "open" || value === "closed";
 }
 
+function isConversationRoute(value: unknown): value is ConversationRoute {
+  return value === "moment" || value === "decision" || value === "unclear";
+}
+
 function isMomentKind(value: unknown): value is MomentKind {
   return value === "Before something" || value === "After something" || value === "Just noticed something";
 }
@@ -2508,7 +2631,8 @@ function isDecisionFrame(value: unknown): value is DecisionFrame {
     value.unknowns.every((item) => typeof item === "string") &&
     (value.currentFocus === null || typeof value.currentFocus === "string") &&
     (value.nextStep === null || typeof value.nextStep === "string") &&
-    (value.sourceSessionId === null || typeof value.sourceSessionId === "string")
+    (value.sourceSessionId === null || typeof value.sourceSessionId === "string") &&
+    (value.sourceSummary === null || typeof value.sourceSummary === "string")
   );
 }
 
@@ -2551,7 +2675,8 @@ function normalizeDecisionFrame(value: unknown): DecisionFrame | null {
         ? value.currentFocus
         : chooseDecisionCurrentFocus({ threads, criteria, tradeoffs, unknowns }),
     nextStep: typeof value.nextStep === "string" ? value.nextStep : null,
-    sourceSessionId: typeof value.sourceSessionId === "string" ? value.sourceSessionId : null
+    sourceSessionId: typeof value.sourceSessionId === "string" ? value.sourceSessionId : null,
+    sourceSummary: typeof value.sourceSummary === "string" ? value.sourceSummary : null
   };
 }
 
@@ -2589,6 +2714,17 @@ function normalizeSession(session: CurrentSession): CurrentSession {
       typeof (session as CurrentSession & { eventType?: unknown }).eventType === "string"
         ? (session as CurrentSession & { eventType: string }).eventType
         : undefined,
+    conversationRoute: isConversationRoute((session as CurrentSession & { conversationRoute?: unknown }).conversationRoute)
+      ? (session as CurrentSession & { conversationRoute: ConversationRoute }).conversationRoute
+      : "moment",
+    activeDecisionFrameId:
+      typeof (session as CurrentSession & { activeDecisionFrameId?: unknown }).activeDecisionFrameId === "string"
+        ? (session as CurrentSession & { activeDecisionFrameId: string }).activeDecisionFrameId
+        : null,
+    awaitingRouteChoice:
+      typeof (session as CurrentSession & { awaitingRouteChoice?: unknown }).awaitingRouteChoice === "boolean"
+        ? (session as CurrentSession & { awaitingRouteChoice: boolean }).awaitingRouteChoice
+        : false,
     messages: session.messages.map((message, index) => {
       if (message.role === "user") return message;
 
@@ -2709,6 +2845,9 @@ function legacyEntriesToSessions(entries: LegacyEntry[]): CompletedSession[] {
     turnCount: 1,
     userDepthSignal: inferUserDepthSignal(entry.response),
     touchpointType: "daily_check_in",
+    conversationRoute: "moment",
+    activeDecisionFrameId: null,
+    awaitingRouteChoice: false,
     tags: entry.tags,
     summary: entry.response,
     messages: [
@@ -2888,7 +3027,64 @@ export default function Home() {
       return;
     }
 
+    if (currentSession.awaitingRouteChoice) {
+      if (isReflectRouteChoice(trimmed) || (isNoSignal(trimmed) && currentSession.conversationRoute === "unclear")) {
+        const sessionWithChoice: CurrentSession = {
+          ...currentSession,
+          conversationRoute: "moment",
+          awaitingRouteChoice: false,
+          messages: [
+            ...currentSession.messages,
+            makeUserMessage(trimmed),
+            makeClaraMessage({
+              text: "Okay. We'll treat it like a moment to reflect on. What part feels most worth noticing?",
+              expectedInput: "text"
+            })
+          ]
+        };
+        setCurrentSession(sessionWithChoice);
+        setAnswer("");
+        return;
+      }
+
+      if (isThinkRouteChoice(trimmed) || isYesSignal(trimmed)) {
+        const frameText = latestSubstantiveUserText(currentSession) || sessionText(currentSession) || trimmed;
+        const frame = decisionFrameFromText(frameText, currentSession);
+        const sessionWithFrame: CurrentSession = {
+          ...currentSession,
+          conversationRoute: "decision",
+          activeDecisionFrameId: frame.id,
+          awaitingRouteChoice: false,
+          messages: [...currentSession.messages, makeUserMessage(trimmed)]
+        };
+
+        console.log("Decision Frame detected", frame);
+        setDecisionFrames((current) =>
+          current.some((existing) => sameDecisionFrame(existing, frame)) ? current : [frame, ...current]
+        );
+
+        const claraResult = await generateClaraFromConversation(sessionWithFrame, profile, sessions, {
+          userIntent: "confirm",
+          decisionFrame: frame
+        });
+        setCurrentSession({
+          ...sessionWithFrame,
+          messages: [
+            ...sessionWithFrame.messages,
+            makeClaraMessage({
+              text: claraResult.text,
+              expectedInput: "text"
+            })
+          ]
+        });
+        setAnswer("");
+        return;
+      }
+    }
+
     const detectedUserIntent = detectUserIntent(trimmed, currentSession);
+    const currentlyInDecisionLoop =
+      currentSession.conversationRoute === "decision" || activeDecisionFrameForSession(decisionFrames, currentSession) !== null;
     console.log("detectedUserIntent", detectedUserIntent);
 
     if (detectedUserIntent === "polite_close") {
@@ -2901,12 +3097,12 @@ export default function Home() {
     if (detectedUserIntent === "explicit_stop") {
       const closeReason = "explicit_stop";
       console.log("closeReason", closeReason);
-      await closeSession(trimmed, "Of course. I'll save this for now.");
+      await closeSession(trimmed, currentlyInDecisionLoop ? "Saved to Frames. We can leave it there for now." : "Of course. I'll save this for now.");
       return;
     }
 
     if (detectedUserIntent === "save") {
-      await closeSession(trimmed, "Saved. That's a good place to leave it for today.");
+      await closeSession(trimmed, currentlyInDecisionLoop ? "Saved to Frames. We can leave it there for now." : "Saved. That's a good place to leave it for today.");
       return;
     }
 
@@ -2932,7 +3128,7 @@ export default function Home() {
     }
 
     if (isSaveChoice(trimmed)) {
-      await closeSession(trimmed, "Saved. That's a good place to leave it for today.");
+      await closeSession(trimmed, currentlyInDecisionLoop ? "Saved to Frames. We can leave it there for now." : "Saved. That's a good place to leave it for today.");
       return;
     }
 
@@ -2942,9 +3138,35 @@ export default function Home() {
       messages: [...currentSession.messages, userMessage]
     };
     const existingDecisionFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
-    const newDecisionFrame = isDecisionMoment(trimmed) ? decisionFrameFromText(trimmed, sessionWithReply) : null;
+    const routedAs = routeConversationMessage(trimmed, currentSession, existingDecisionFrame);
+
+    if (routedAs === "unclear") {
+      setCurrentSession({
+        ...sessionWithReply,
+        conversationRoute: "unclear",
+        awaitingRouteChoice: true,
+        messages: [
+          ...sessionWithReply.messages,
+          makeClaraMessage({
+            text: routeChoiceText("unclear"),
+            expectedInput: "choice",
+            choices: ["Reflect on it", "Think it through"]
+          })
+        ]
+      });
+      setAnswer("");
+      return;
+    }
+
+    const newDecisionFrame = routedAs === "decision" && !existingDecisionFrame ? decisionFrameFromText(trimmed, sessionWithReply) : null;
     let decisionFrame = newDecisionFrame ?? existingDecisionFrame;
     let decisionFrameUpdate: DecisionFrameUpdate | null = null;
+    let routedSession: CurrentSession = {
+      ...sessionWithReply,
+      conversationRoute: routedAs,
+      activeDecisionFrameId: decisionFrame?.id ?? sessionWithReply.activeDecisionFrameId,
+      awaitingRouteChoice: false
+    };
 
     if (newDecisionFrame) {
       console.log("Decision Frame detected", newDecisionFrame);
@@ -2953,26 +3175,30 @@ export default function Home() {
       );
     } else if (existingDecisionFrame && shouldUpdateDecisionFrameFromIntent(detectedUserIntent)) {
       const update = inferDecisionFrameUpdate(trimmed, existingDecisionFrame);
-      const updatedDecisionFrame = applyDecisionFrameUpdate(existingDecisionFrame, update);
+      const updatedDecisionFrame = hasDecisionFrameUpdate(update)
+        ? applyDecisionFrameUpdate(existingDecisionFrame, update)
+        : updateDecisionFrameSourceSummary(existingDecisionFrame, sessionWithReply, trimmed);
       decisionFrame = updatedDecisionFrame;
       decisionFrameUpdate = hasDecisionFrameUpdate(update) ? update : null;
 
-      if (decisionFrameUpdate) {
-        console.log("Decision Frame updated", { frame: updatedDecisionFrame, update });
-        setDecisionFrames((current) =>
-          current.map((frame) => (frame.id === updatedDecisionFrame.id ? updatedDecisionFrame : frame))
-        );
-      }
+      console.log("Decision Frame updated", { frame: updatedDecisionFrame, update });
+      setDecisionFrames((current) =>
+        current.map((frame) => (frame.id === updatedDecisionFrame.id ? updatedDecisionFrame : frame))
+      );
+      routedSession = {
+        ...routedSession,
+        activeDecisionFrameId: updatedDecisionFrame.id
+      };
     }
 
-    if (shouldCloseForDepth(sessionWithReply, trimmed)) {
+    if (shouldCloseForDepth(routedSession, trimmed)) {
       await closeSession(trimmed, "That's a good place to leave it for today.");
       return;
     }
 
     if (currentSession.awaitingThreadRedirect) {
       const redirectedSession: CurrentSession = {
-        ...sessionWithReply,
+        ...routedSession,
         activeThread: trimmed,
         threadSource: "user",
         threadConfidence: 1,
@@ -2999,16 +3225,16 @@ export default function Home() {
     }
 
     if (isThreadCorrectionChoice && (normalizeChoice(trimmed) === "yes, that" || normalizeChoice(trimmed) === "yes that")) {
-      const claraResult = await generateClaraFromConversation(sessionWithReply, profile, sessions, {
+      const claraResult = await generateClaraFromConversation(routedSession, profile, sessions, {
         userIntent: detectedUserIntent,
         decisionFrame,
         decisionFrameUpdate
       });
       setCurrentSession(maybeApplyDepthCheck({
-        ...sessionWithReply,
+        ...routedSession,
         awaitingThreadRedirect: false,
         messages: [
-          ...sessionWithReply.messages,
+          ...routedSession.messages,
           makeClaraMessage({
             text: claraResult.text,
             expectedInput: "text"
@@ -3019,16 +3245,16 @@ export default function Home() {
       return;
     }
 
-    const claraResult = await generateClaraFromConversation(sessionWithReply, profile, sessions, {
+    const claraResult = await generateClaraFromConversation(routedSession, profile, sessions, {
       userIntent: detectedUserIntent,
       decisionFrame,
       decisionFrameUpdate
     });
     setCurrentSession(
       maybeApplyDepthCheck({
-        ...sessionWithReply,
+        ...routedSession,
         messages: [
-          ...sessionWithReply.messages,
+          ...routedSession.messages,
           makeClaraMessage({
             text: claraResult.text,
             expectedInput: "text"
@@ -3220,7 +3446,9 @@ export default function Home() {
   async function closeSession(choiceText?: string, claraText?: string) {
     if (!currentSession) return;
 
-    const finalClaraText = claraText ?? "That's a good place to leave it for today.";
+    const activeFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
+    const isDecisionSession = currentSession.conversationRoute === "decision" || activeFrame !== null;
+    const finalClaraText = claraText ?? (isDecisionSession ? "Saved to Frames. We can leave it there for now." : "That's a good place to leave it for today.");
     const now = new Date().toISOString();
     const messages = choiceText
       ? [
@@ -3252,6 +3480,15 @@ export default function Home() {
     setAnswer("");
     setClosingMessage(finalClaraText);
     window.localStorage.removeItem(STORAGE_KEYS.currentSession);
+
+    if (isDecisionSession) {
+      if (activeFrame) {
+        const updatedFrame = updateDecisionFrameSourceSummary(activeFrame, closedSession, choiceText ?? "");
+        setDecisionFrames((current) => current.map((frame) => (frame.id === updatedFrame.id ? updatedFrame : frame)));
+      }
+      return;
+    }
+
     void generateMeaningNoteForSession(closedSession);
   }
 
@@ -4088,15 +4325,17 @@ function FrameSoFarCard({ frame }: { frame: DecisionFrame }) {
           Frames help you see the shape of a messy question before choosing what to do.
         </p>
         <p className="text-lg leading-7 text-pearl">{frame.question}</p>
-        {frame.currentFocus ? (
-          <div className="space-y-1">
-            <p className="text-sm text-clay">Current focus</p>
-            <p className="text-base leading-6 text-fog">{frame.currentFocus}</p>
-          </div>
-        ) : null}
+        <div className="space-y-1">
+          <p className="text-sm text-clay">Current focus</p>
+          <p className="text-base leading-6 text-fog">{frame.currentFocus || "Not clear yet."}</p>
+        </div>
         <CompactFrameSection label="What's involved" values={frame.threads} />
         <CompactFrameSection label="Tensions" values={frame.tradeoffs} />
         <CompactFrameSection label="What we still don't know" values={frame.unknowns} />
+        <div className="space-y-1">
+          <p className="text-sm text-clay">Next honest step</p>
+          <p className="text-base leading-6 text-fog">{frame.nextStep || "Not clear yet."}</p>
+        </div>
       </div>
     </details>
   );
@@ -4104,7 +4343,6 @@ function FrameSoFarCard({ frame }: { frame: DecisionFrame }) {
 
 function CompactFrameSection({ label, values }: { label: string; values: string[] }) {
   const [expanded, setExpanded] = useState(false);
-  if (values.length === 0) return null;
 
   const visibleValues = expanded ? values : values.slice(0, 3);
   const hiddenCount = values.length - visibleValues.length;
@@ -4112,7 +4350,7 @@ function CompactFrameSection({ label, values }: { label: string; values: string[
   return (
     <div className="space-y-2">
       <p className="text-sm text-clay">{label}</p>
-      <TagList values={visibleValues} />
+      {visibleValues.length === 0 ? <p className="text-base leading-6 text-fog">Not clear yet.</p> : <TagList values={visibleValues} />}
       {hiddenCount > 0 ? (
         <button
           className="text-sm text-fog underline decoration-pearl/30 underline-offset-4"
@@ -4192,6 +4430,11 @@ function DecisionFrameDetail({
       <section className="space-y-1 border-t border-pearl/10 pt-5">
         <p className="text-sm text-clay">Next honest step</p>
         <p className="text-lg leading-7 text-fog">{frame.nextStep || "Not clear yet."}</p>
+      </section>
+
+      <section className="space-y-1 border-t border-pearl/10 pt-5">
+        <p className="text-sm text-clay">Source conversation summary</p>
+        <p className="text-lg leading-7 text-fog">{frame.sourceSummary || "Not clear yet."}</p>
       </section>
     </section>
   );
