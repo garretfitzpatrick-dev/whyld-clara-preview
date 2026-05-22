@@ -40,6 +40,7 @@ type DecisionFrameType = "life" | "work" | "family" | "goals" | "meeting" | "oth
 type DecisionFrameStatus = "open" | "closed";
 type DecisionFrameStage = "opening" | "mapping" | "clarifying" | "next_step" | "paused" | "closed";
 type DecisionMode = "reflect" | "map" | "research" | "compare" | "act";
+type ResearchTaskStatus = "open" | "done";
 type ResponseStrategy =
   | "acknowledge"
   | "reflect"
@@ -124,6 +125,13 @@ type MeaningNote = {
   confidence: MeaningNoteConfidence;
 };
 
+type ResearchTask = {
+  id: string;
+  question: string;
+  status: ResearchTaskStatus;
+  notes?: string;
+};
+
 type DecisionFrame = {
   id: string;
   createdAt: string;
@@ -142,6 +150,8 @@ type DecisionFrame = {
   possiblePaths: string[];
   optionNotes: string[];
   comparisonNotes: string[];
+  researchQuestions: string[];
+  researchTasks: ResearchTask[];
   currentFocus: string | null;
   nextStep: string | null;
   sourceSessionId: string | null;
@@ -157,6 +167,8 @@ type DecisionFrameUpdate = {
   possiblePaths: string[];
   optionNotes: string[];
   comparisonNotes: string[];
+  researchQuestions: string[];
+  researchTasks: ResearchTask[];
   currentFocus: string | null;
   nextStep: string | null;
   frameSummary: string | null;
@@ -284,7 +296,7 @@ const momentKindPrompts: Record<MomentKind, string> = {
 };
 const decisionPauseChoices = ["Keep working it", "Pause here", "Find next honest step"];
 const decisionResumeChoices = ["What we still don't know", "Next honest step", "Keep mapping"];
-const decisionModeChoices = ["Reflect", "Map options", "Find unknowns", "Compare paths", "Next step"];
+const decisionModeChoices = ["Reflect", "Map options", "Find unknowns", "Compare paths", "Next step", "Research"];
 
 const tagLexicon: Record<ThemeTag, string[]> = {
   stress: [
@@ -1797,7 +1809,8 @@ type DecisionControlChoice =
   | "mode_reflect"
   | "mode_map"
   | "mode_research"
-  | "mode_compare";
+  | "mode_compare"
+  | "mode_research_list";
 
 function decisionControlChoice(text: string): DecisionControlChoice | null {
   const normalized = normalizeChoice(text);
@@ -1810,6 +1823,7 @@ function decisionControlChoice(text: string): DecisionControlChoice | null {
   if (normalized === "reflect") return "mode_reflect";
   if (normalized === "map options") return "mode_map";
   if (normalized === "find unknowns") return "mode_research";
+  if (normalized === "research") return "mode_research_list";
   if (normalized === "compare paths") return "mode_compare";
   return null;
 }
@@ -1821,6 +1835,7 @@ function decisionModeForControlChoice(choice: DecisionControlChoice, fallback: D
   if (choice === "mode_reflect") return "reflect";
   if (choice === "mode_map") return "map";
   if (choice === "mode_research") return "research";
+  if (choice === "mode_research_list") return "research";
   if (choice === "mode_compare") return "compare";
   return fallback;
 }
@@ -1834,7 +1849,7 @@ function decisionStageForMode(mode: DecisionMode): DecisionFrameStage {
 function decisionFocusForMode(mode: DecisionMode) {
   if (mode === "reflect") return "what matters";
   if (mode === "map") return "possible paths";
-  if (mode === "research") return "what we still don't know";
+  if (mode === "research") return "research list";
   if (mode === "compare") return "compare paths";
   return "next honest step";
 }
@@ -1889,14 +1904,21 @@ function applyDecisionControlToFrame(frame: DecisionFrame, choice: DecisionContr
     };
   }
 
-  if (choice === "mode_reflect" || choice === "mode_map" || choice === "mode_research" || choice === "mode_compare") {
+  if (
+    choice === "mode_reflect" ||
+    choice === "mode_map" ||
+    choice === "mode_research" ||
+    choice === "mode_research_list" ||
+    choice === "mode_compare"
+  ) {
+    const currentFocus = choice === "mode_research" ? "what we still don't know" : decisionFocusForMode(currentDecisionMode);
     return {
       ...frame,
       updatedAt,
       status: "open",
       currentDecisionMode,
       stage: decisionStageForMode(currentDecisionMode),
-      currentFocus: decisionFocusForMode(currentDecisionMode)
+      currentFocus
     };
   }
 
@@ -2077,6 +2099,7 @@ function decisionFrameFromText(text: string, session: CurrentSession): DecisionF
   const unknowns = inferDecisionUnknowns(text, decisionType);
   const currentFocus = chooseDecisionCurrentFocus({ threads, criteria, tradeoffs, unknowns });
   const possiblePaths = inferDecisionPossiblePaths(text, decisionType);
+  const researchQuestions = inferResearchQuestions(text, decisionType, unknowns, possiblePaths);
   const currentDecisionMode = inferInitialDecisionMode(text, possiblePaths, unknowns);
   const frameSummary = inferFrameSummary({
     decisionType,
@@ -2105,6 +2128,8 @@ function decisionFrameFromText(text: string, session: CurrentSession): DecisionF
     possiblePaths,
     optionNotes: [],
     comparisonNotes: [],
+    researchQuestions,
+    researchTasks: makeResearchTasks(researchQuestions),
     currentFocus,
     nextStep: inferDecisionNextStep(text, decisionType, tradeoffs),
     sourceSessionId: session.sessionId,
@@ -2115,7 +2140,13 @@ function decisionFrameFromText(text: string, session: CurrentSession): DecisionF
 function inferInitialDecisionMode(text: string, possiblePaths: string[], unknowns: string[]): DecisionMode {
   const lower = text.toLowerCase();
 
-  if (/\bwhat should i research|find out|facts?|data|information|how would i figure this out\b/.test(lower)) return "research";
+  if (
+    /\b(can you research|can you do the research|what should i research|find out|facts?|data|information|how would i figure this out|how do i find out|don'?t know enough|need more information|what facts do we need)\b/.test(
+      lower
+    )
+  ) {
+    return "research";
+  }
   if (/\bwhat are my options|options|paths|alternatives|ideas\b/.test(lower)) return "map";
   if (/\bcompare|weigh|against|side by side\b/.test(lower)) return "compare";
   if (/\bnext step|what do i do next|where do i start\b/.test(lower)) return "act";
@@ -2325,6 +2356,71 @@ function inferDecisionPossiblePaths(text: string, decisionType: DecisionFrameTyp
   return uniqueStrings(paths).slice(0, 6);
 }
 
+function inferResearchQuestions(
+  text: string,
+  decisionType: DecisionFrameType,
+  unknowns: string[] = [],
+  possiblePaths: string[] = []
+) {
+  const lower = text.toLowerCase();
+  const asksForResearch =
+    /\b(can you research|can you do the research|what should i research|how do i find out|don'?t know enough|need more information|what facts do we need|find out|research)\b/.test(
+      lower
+    );
+  const questions: string[] = [];
+
+  if (decisionType === "family" && /\bschool|district|move|moving|kids?|children|budget cuts?\b/.test(lower)) {
+    questions.push(
+      "Which districts are realistic for the family?",
+      "What academic options do those schools offer?",
+      "How stable are the school budgets?",
+      "What would the move cost financially, socially, and day to day?",
+      "Would moving actually create a better school fit?"
+    );
+  } else if (decisionType === "work") {
+    questions.push(
+      "What would need to change in the current role?",
+      "What options exist inside or outside the current job?",
+      "What would each path ask from energy, money, and family life?"
+    );
+  } else if (decisionType === "meeting") {
+    questions.push(
+      "What outcome would make the meeting worth it?",
+      "Who needs to be aligned before the meeting?",
+      "What facts or examples would make the conversation clearer?"
+    );
+  } else if (asksForResearch) {
+    questions.push(
+      "What facts would change the decision?",
+      "Which options are actually realistic?",
+      "What would make one path clearly harder or easier?"
+    );
+  }
+
+  return uniqueStrings([...questions, ...unknowns.map((unknown) => `Find out ${unknown.toLowerCase()}`), ...possiblePaths.map((path) => `What would it take to ${path}?`)]).slice(0, 8);
+}
+
+function makeResearchTasks(questions: string[]): ResearchTask[] {
+  return questions.map((question) => ({
+    id: crypto.randomUUID(),
+    question,
+    status: "open"
+  }));
+}
+
+function mergeResearchTasks(existing: ResearchTask[], incoming: ResearchTask[]) {
+  const byQuestion = new Map(existing.map((task) => [normalizeDecisionQuestion(task.question), task]));
+
+  incoming.forEach((task) => {
+    const key = normalizeDecisionQuestion(task.question);
+    if (!byQuestion.has(key)) {
+      byQuestion.set(key, task);
+    }
+  });
+
+  return Array.from(byQuestion.values()).slice(0, 12);
+}
+
 function chooseDecisionCurrentFocus({
   threads,
   criteria,
@@ -2411,7 +2507,11 @@ function inferDecisionModeFromText(text: string, frame: DecisionFrame): Decision
 
   if (/\b(next step|what do i do next|what should i do now|where do i start|take action)\b/.test(lower)) return "act";
   if (/\b(compare|weigh|against|side by side|which option|which path|tradeoffs between)\b/.test(lower)) return "compare";
-  if (/\b(what should i research|what do i need to find out|find out|research|how would i figure this out|facts?|data|information)\b/.test(lower)) {
+  if (
+    /\b(can you research|can you do the research|what should i research|what do i need to find out|find out|research|how would i figure this out|how do i find out|don'?t know enough|need more information|what facts do we need|facts?|data|information)\b/.test(
+      lower
+    )
+  ) {
     return "research";
   }
   if (/\b(do you have any ideas|what are my options|possible options|options|paths|alternatives|ideas)\b/.test(lower)) return "map";
@@ -2450,6 +2550,7 @@ function inferDecisionFrameUpdate(text: string, frame: DecisionFrame): DecisionF
   const optionNotes = inferOptionNotes(text);
   const comparisonNotes = inferComparisonNotes(text);
   const currentDecisionMode = inferDecisionModeFromText(text, frame);
+  const researchQuestions: string[] = [];
   let nextStep: string | null = null;
 
   if (/\bhappy\b/.test(lower) && /\bchalleng|growth|academic|school\b/.test(lower)) {
@@ -2504,6 +2605,17 @@ function inferDecisionFrameUpdate(text: string, frame: DecisionFrame): DecisionF
     possiblePaths.push(...inferDecisionPossiblePaths(`${frame.question} ${text}`, frame.decisionType));
   }
 
+  if (currentDecisionMode === "research") {
+    researchQuestions.push(
+      ...inferResearchQuestions(
+        `${frame.question} ${text}`,
+        frame.decisionType,
+        uniqueStrings([...frame.unknowns, ...unknowns]),
+        uniqueStrings([...frame.possiblePaths, ...possiblePaths])
+      )
+    );
+  }
+
   if (/\bi know|we know|definitely|for sure|it's clear|its clear\b/.test(lower)) {
     knowns.push(shortenDecisionItem(text));
   }
@@ -2531,6 +2643,8 @@ function inferDecisionFrameUpdate(text: string, frame: DecisionFrame): DecisionF
     possiblePaths: uniqueStrings(possiblePaths).slice(0, 5),
     optionNotes: uniqueStrings(optionNotes).slice(0, 5),
     comparisonNotes: uniqueStrings(comparisonNotes).slice(0, 5),
+    researchQuestions: uniqueStrings(researchQuestions).slice(0, 8),
+    researchTasks: makeResearchTasks(uniqueStrings(researchQuestions).slice(0, 8)),
     currentFocus:
       (currentDecisionMode ? decisionFocusForMode(currentDecisionMode) : null) ??
       chooseDecisionCurrentFocus({ threads, criteria, tradeoffs, unknowns }) ??
@@ -2571,6 +2685,8 @@ function applyDecisionFrameUpdate(frame: DecisionFrame, update: DecisionFrameUpd
     possiblePaths: uniqueStrings([...frame.possiblePaths, ...update.possiblePaths]).slice(0, 8),
     optionNotes: uniqueStrings([...frame.optionNotes, ...update.optionNotes]).slice(0, 8),
     comparisonNotes: uniqueStrings([...frame.comparisonNotes, ...update.comparisonNotes]).slice(0, 8),
+    researchQuestions: uniqueStrings([...frame.researchQuestions, ...update.researchQuestions]).slice(0, 12),
+    researchTasks: mergeResearchTasks(frame.researchTasks, update.researchTasks),
     currentFocus: update.currentFocus ?? frame.currentFocus,
     nextStep: update.nextStep ?? frame.nextStep,
     frameSummary:
@@ -2613,6 +2729,8 @@ function emptyDecisionFrameUpdate(currentFocus: string | null): DecisionFrameUpd
     possiblePaths: [],
     optionNotes: [],
     comparisonNotes: [],
+    researchQuestions: [],
+    researchTasks: [],
     currentFocus,
     nextStep: null,
     frameSummary: null,
@@ -2631,6 +2749,8 @@ function hasDecisionFrameUpdate(update: DecisionFrameUpdate) {
     update.possiblePaths.length > 0 ||
     update.optionNotes.length > 0 ||
     update.comparisonNotes.length > 0 ||
+    update.researchQuestions.length > 0 ||
+    update.researchTasks.length > 0 ||
     update.nextStep !== null ||
     update.frameSummary !== null ||
     update.stage !== null ||
@@ -2690,6 +2810,8 @@ function decisionFrameUpdateMemory(update: DecisionFrameUpdate) {
     update.possiblePaths.length > 0 ? `Possible paths added: ${update.possiblePaths.join(", ")}` : "",
     update.optionNotes.length > 0 ? `Option notes added: ${update.optionNotes.join(", ")}` : "",
     update.comparisonNotes.length > 0 ? `Comparison notes added: ${update.comparisonNotes.join(", ")}` : "",
+    update.researchQuestions.length > 0 ? `Research questions added: ${update.researchQuestions.join(", ")}` : "",
+    update.researchTasks.length > 0 ? `Research tasks added: ${update.researchTasks.map((task) => task.question).join(", ")}` : "",
     update.currentFocus ? `Current focus: ${update.currentFocus}` : "",
     update.nextStep ? `Next honest step added: ${update.nextStep}` : "",
     update.frameSummary ? `Shape of the question: ${update.frameSummary}` : "",
@@ -2719,6 +2841,8 @@ function decisionFrameMemory(frame: DecisionFrame) {
     frame.possiblePaths.length > 0 ? `Possible paths: ${frame.possiblePaths.join(", ")}` : "",
     frame.optionNotes.length > 0 ? `Option notes: ${frame.optionNotes.join(", ")}` : "",
     frame.comparisonNotes.length > 0 ? `Comparison notes: ${frame.comparisonNotes.join(", ")}` : "",
+    frame.researchQuestions.length > 0 ? `Research questions: ${frame.researchQuestions.join(", ")}` : "",
+    frame.researchTasks.length > 0 ? `Research tasks: ${frame.researchTasks.map((task) => `${task.question} (${task.status})`).join(", ")}` : "",
     frame.nextStep ? `Next honest step: ${frame.nextStep}` : "",
     frame.sourceSummary ? `Source conversation summary: ${frame.sourceSummary}` : "",
     "Use the frame_decision listening move. Do not decide for the user.",
@@ -3038,6 +3162,16 @@ function isMeaningNote(value: unknown): value is MeaningNote {
   );
 }
 
+function isResearchTask(value: unknown): value is ResearchTask {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.question === "string" &&
+    (value.status === "open" || value.status === "done") &&
+    (value.notes === undefined || typeof value.notes === "string")
+  );
+}
+
 function isDecisionFrame(value: unknown): value is DecisionFrame {
   return (
     isRecord(value) &&
@@ -3066,6 +3200,10 @@ function isDecisionFrame(value: unknown): value is DecisionFrame {
     value.optionNotes.every((item) => typeof item === "string") &&
     Array.isArray(value.comparisonNotes) &&
     value.comparisonNotes.every((item) => typeof item === "string") &&
+    Array.isArray(value.researchQuestions) &&
+    value.researchQuestions.every((item) => typeof item === "string") &&
+    Array.isArray(value.researchTasks) &&
+    value.researchTasks.every(isResearchTask) &&
     (value.currentFocus === null || typeof value.currentFocus === "string") &&
     (value.nextStep === null || typeof value.nextStep === "string") &&
     (value.sourceSessionId === null || typeof value.sourceSessionId === "string") &&
@@ -3097,6 +3235,12 @@ function normalizeDecisionFrame(value: unknown): DecisionFrame | null {
   const storedPossiblePaths = cleanStringList(value.possiblePaths);
   const possiblePaths =
     storedPossiblePaths.length > 0 ? storedPossiblePaths : inferDecisionPossiblePaths(value.question, value.decisionType);
+  const storedResearchQuestions = cleanStringList(value.researchQuestions);
+  const researchQuestions =
+    storedResearchQuestions.length > 0
+      ? storedResearchQuestions
+      : inferResearchQuestions(value.question, value.decisionType, unknowns, possiblePaths);
+  const storedResearchTasks = Array.isArray(value.researchTasks) ? value.researchTasks.filter(isResearchTask) : [];
   const nextStep = typeof value.nextStep === "string" ? value.nextStep : null;
   const status = isDecisionFrameStatus(value.status) ? value.status : "open";
   const stage = isDecisionFrameStage(value.stage)
@@ -3143,6 +3287,8 @@ function normalizeDecisionFrame(value: unknown): DecisionFrame | null {
     possiblePaths,
     optionNotes: cleanStringList(value.optionNotes),
     comparisonNotes: cleanStringList(value.comparisonNotes),
+    researchQuestions,
+    researchTasks: storedResearchTasks.length > 0 ? storedResearchTasks : makeResearchTasks(researchQuestions),
     currentFocus:
       typeof value.currentFocus === "string"
         ? value.currentFocus
@@ -4129,7 +4275,19 @@ export default function Home() {
 
   function updateDecisionFrame(id: string, updates: Partial<DecisionFrame>) {
     setDecisionFrames((current) =>
-      current.map((frame) => (frame.id === id ? { ...frame, ...updates, updatedAt: new Date().toISOString() } : frame))
+      current.map((frame) => {
+        if (frame.id !== id) return frame;
+
+        const researchQuestions = updates.researchQuestions ?? frame.researchQuestions;
+        const researchTasks =
+          updates.researchTasks ??
+          mergeResearchTasks(
+            frame.researchTasks,
+            makeResearchTasks(researchQuestions.filter((question) => !frame.researchTasks.some((task) => task.question === question)))
+          );
+
+        return { ...frame, ...updates, researchQuestions, researchTasks, updatedAt: new Date().toISOString() };
+      })
     );
   }
 
@@ -4220,6 +4378,22 @@ export default function Home() {
       awaitingRouteChoice: false
     });
     setTab("Today");
+  }
+
+  function selectDecisionMode(choice: string) {
+    if (!currentSession) return;
+
+    const activeFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
+    const controlChoice = activeFrame ? decisionControlChoice(choice) : null;
+    if (!activeFrame || !controlChoice || controlChoice === "pause" || controlChoice === "keep_working") return;
+
+    const updatedFrame = applyDecisionControlToFrame(activeFrame, controlChoice);
+    setDecisionFrames((current) => current.map((frame) => (frame.id === updatedFrame.id ? updatedFrame : frame)));
+    setCurrentSession({
+      ...currentSession,
+      conversationRoute: "decision",
+      activeDecisionFrameId: updatedFrame.id
+    });
   }
 
   async function generateWeeklyMeaningThread() {
@@ -4380,21 +4554,23 @@ export default function Home() {
 
           {currentSession ? (
             <>
-              {activeDecisionFrame ? (
-                <>
-                  <FrameSoFarCard frame={activeDecisionFrame} />
-                  <DecisionModeChips
-                    currentMode={activeDecisionFrame.currentDecisionMode}
-                    onSelect={(choice) => void continueConversation(choice)}
-                  />
-                </>
-              ) : null}
+              {activeDecisionFrame ? <FrameSoFarCard frame={activeDecisionFrame} /> : null}
 
               <section className="space-y-4">
                 {currentSession.messages.map((message, index) => (
                   <ConversationBubble message={message} key={`${message.timestamp}-${index}`} />
                 ))}
               </section>
+
+              {activeDecisionFrame && latestExpectedInput !== "none" ? (
+                <div className="sticky bottom-24 z-10 -mx-1 rounded-md border border-pearl/10 bg-ink/95 p-3 shadow-2xl shadow-ink/50 backdrop-blur">
+                  <DecisionModeChips
+                    currentMode={activeDecisionFrame.currentDecisionMode}
+                    currentFocus={activeDecisionFrame.currentFocus}
+                    onSelect={selectDecisionMode}
+                  />
+                </div>
+              ) : null}
 
               {latestExpectedInput === "choice" && requiredChoices.length > 0 && (
                 <div className="flex flex-wrap gap-2">
@@ -4952,9 +5128,11 @@ function FrameSoFarCard({ frame }: { frame: DecisionFrame }) {
 
 function DecisionModeChips({
   currentMode,
+  currentFocus,
   onSelect
 }: {
   currentMode: DecisionMode;
+  currentFocus: string | null;
   onSelect: (choice: string) => void;
 }) {
   return (
@@ -4962,8 +5140,7 @@ function DecisionModeChips({
       <p className="text-sm text-clay">Thinking mode</p>
       <div className="flex flex-wrap gap-2">
         {decisionModeChoices.map((choice) => {
-          const mode = decisionModeForControlChoice(decisionControlChoice(choice) ?? "keep_working", currentMode);
-          const active = mode === currentMode;
+          const active = isActiveDecisionModeChoice(choice, currentMode, currentFocus);
 
           return (
             <button
@@ -4983,6 +5160,15 @@ function DecisionModeChips({
       </div>
     </section>
   );
+}
+
+function isActiveDecisionModeChoice(choice: string, currentMode: DecisionMode, currentFocus: string | null) {
+  const controlChoice = decisionControlChoice(choice);
+  const mode = decisionModeForControlChoice(controlChoice ?? "keep_working", currentMode);
+
+  if (choice === "Find unknowns") return currentMode === "research" && currentFocus === "what we still don't know";
+  if (choice === "Research") return currentMode === "research" && currentFocus !== "what we still don't know";
+  return mode === currentMode;
 }
 
 function CompactFrameSection({ label, values }: { label: string; values: string[] }) {
@@ -5082,6 +5268,11 @@ function DecisionFrameDetail({
         <p className="text-lg leading-7 text-fog">{frame.frameSummary || "Not clear yet."}</p>
       </section>
 
+      <section className="space-y-1 border-t border-pearl/10 pt-5">
+        <p className="text-sm text-clay">What this needs next</p>
+        <p className="text-lg leading-7 text-fog">{frameNeedsNext(frame)}</p>
+      </section>
+
       {frame.currentFocus ? (
         <section className="space-y-1 border-t border-pearl/10 pt-5">
           <p className="text-sm text-clay">Current focus</p>
@@ -5094,6 +5285,8 @@ function DecisionFrameDetail({
       <FrameDetailSection label="What we still don't know" values={frame.unknowns} />
       <FrameDetailSection label="Possible paths" values={frame.possiblePaths} />
       <FrameDetailSection label="Tensions" values={frame.tradeoffs} />
+      <FrameDetailSection label="Research questions" values={frame.researchQuestions} emptyText="Not started yet." />
+      <ResearchTaskSection tasks={frame.researchTasks} />
       <FrameDetailSection label="Option notes" values={frame.optionNotes} />
       <FrameDetailSection label="Comparison notes" values={frame.comparisonNotes} />
 
@@ -5110,16 +5303,45 @@ function DecisionFrameDetail({
   );
 }
 
-function FrameDetailSection({ label, values }: { label: string; values: string[] }) {
+function FrameDetailSection({
+  label,
+  values,
+  emptyText = "Not clear yet."
+}: {
+  label: string;
+  values: string[];
+  emptyText?: string;
+}) {
   return (
     <details className="border-t border-pearl/10 pt-5" open>
       <summary className="cursor-pointer text-sm text-clay">{label}</summary>
       {values.length === 0 ? (
-        <p className="mt-3 text-lg leading-7 text-fog">Not clear yet.</p>
+        <p className="mt-3 text-lg leading-7 text-fog">{emptyText}</p>
       ) : (
         <ul className="mt-3 space-y-2 text-lg leading-7 text-fog">
           {values.map((value) => (
             <li key={value}>{value}</li>
+          ))}
+        </ul>
+      )}
+    </details>
+  );
+}
+
+function ResearchTaskSection({ tasks }: { tasks: ResearchTask[] }) {
+  return (
+    <details className="border-t border-pearl/10 pt-5" open>
+      <summary className="cursor-pointer text-sm text-clay">Research tasks</summary>
+      {tasks.length === 0 ? (
+        <p className="mt-3 text-lg leading-7 text-fog">Not started yet.</p>
+      ) : (
+        <ul className="mt-3 space-y-2 text-lg leading-7 text-fog">
+          {tasks.map((task) => (
+            <li className="space-y-1" key={task.id}>
+              <span>{task.question}</span>
+              <span className="block text-sm text-clay">{task.status}</span>
+              {task.notes ? <span className="block text-base leading-6 text-fog">{task.notes}</span> : null}
+            </li>
           ))}
         </ul>
       )}
@@ -5148,6 +5370,7 @@ function DecisionFrameCard({
   const [possiblePaths, setPossiblePaths] = useState(frame.possiblePaths.join(", "));
   const [optionNotes, setOptionNotes] = useState(frame.optionNotes.join(", "));
   const [comparisonNotes, setComparisonNotes] = useState(frame.comparisonNotes.join(", "));
+  const [researchQuestions, setResearchQuestions] = useState(frame.researchQuestions.join(", "));
   const [frameSummary, setFrameSummary] = useState(frame.frameSummary);
   const [currentFocus, setCurrentFocus] = useState(frame.currentFocus ?? "");
   const [nextStep, setNextStep] = useState(frame.nextStep ?? "");
@@ -5162,6 +5385,7 @@ function DecisionFrameCard({
     setPossiblePaths(frame.possiblePaths.join(", "));
     setOptionNotes(frame.optionNotes.join(", "));
     setComparisonNotes(frame.comparisonNotes.join(", "));
+    setResearchQuestions(frame.researchQuestions.join(", "));
     setFrameSummary(frame.frameSummary);
     setCurrentFocus(frame.currentFocus ?? "");
     setNextStep(frame.nextStep ?? "");
@@ -5179,6 +5403,7 @@ function DecisionFrameCard({
       possiblePaths: commaList(possiblePaths),
       optionNotes: commaList(optionNotes),
       comparisonNotes: commaList(comparisonNotes),
+      researchQuestions: commaList(researchQuestions),
       frameSummary: frameSummary.trim(),
       currentFocus: currentFocus.trim() || null,
       nextStep: nextStep.trim() || null
@@ -5211,6 +5436,7 @@ function DecisionFrameCard({
           <MiniField label="What we know" value={knowns} onChange={setKnowns} />
           <MiniField label="What we still don't know" value={unknowns} onChange={setUnknowns} />
           <MiniField label="Possible paths" value={possiblePaths} onChange={setPossiblePaths} />
+          <MiniField label="Research questions" value={researchQuestions} onChange={setResearchQuestions} />
           <MiniField label="Option notes" value={optionNotes} onChange={setOptionNotes} />
           <MiniField label="Comparison notes" value={comparisonNotes} onChange={setComparisonNotes} />
           <MiniField label="Shape of the question" value={frameSummary} onChange={setFrameSummary} />
@@ -5315,10 +5541,36 @@ function formatFrameStage(stage: DecisionFrameStage) {
 
 function formatDecisionMode(mode: DecisionMode) {
   if (mode === "map") return "Map options";
-  if (mode === "research") return "Find unknowns";
+  if (mode === "research") return "Research";
   if (mode === "compare") return "Compare paths";
   if (mode === "act") return "Next step";
   return "Reflect";
+}
+
+function frameNeedsNext(frame: DecisionFrame) {
+  if (frame.currentDecisionMode === "reflect") return "More reflection";
+  if (frame.currentDecisionMode === "map") return "More options";
+  if (frame.currentDecisionMode === "research") return "More facts";
+  if (frame.currentDecisionMode === "compare") return "Comparison";
+  if (frame.currentDecisionMode === "act") return "Next honest step";
+
+  if (frame.researchQuestions.length > 0 || frame.unknowns.length > 0) {
+    return "More facts";
+  }
+
+  if (frame.possiblePaths.length < 2) {
+    return "More options";
+  }
+
+  if (frame.possiblePaths.length > 1 && frame.criteria.length > 0) {
+    return "Comparison";
+  }
+
+  if (frame.nextStep) {
+    return "Next honest step";
+  }
+
+  return "More reflection";
 }
 
 function MiniField({

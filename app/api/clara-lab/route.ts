@@ -35,8 +35,17 @@ type DecisionFramePayload = {
   possiblePaths?: string[];
   optionNotes?: string[];
   comparisonNotes?: string[];
+  researchQuestions?: string[];
+  researchTasks?: ResearchTaskPayload[];
   currentFocus?: string | null;
   nextStep?: string | null;
+};
+
+type ResearchTaskPayload = {
+  id?: string;
+  question?: string;
+  status?: string;
+  notes?: string;
 };
 
 type DecisionFrameUpdatePayload = {
@@ -48,6 +57,8 @@ type DecisionFrameUpdatePayload = {
   possiblePaths?: string[];
   optionNotes?: string[];
   comparisonNotes?: string[];
+  researchQuestions?: string[];
+  researchTasks?: ResearchTaskPayload[];
   currentFocus?: string | null;
   nextStep?: string | null;
   frameSummary?: string | null;
@@ -274,7 +285,7 @@ function buildResponseGuidance(
         ? "Map mode: help name possible paths or options. If the user asks for ideas, offer a bounded set as possibilities, not advice."
         : "",
       decisionMode === "research"
-        ? "Research mode: focus on unknowns and facts to gather. It is okay to say this may need facts, not more reflection."
+        ? "Research mode: focus on factual unknowns, research questions, sources to check, and a short research checklist. Do not ask subjective reflection questions unless needed."
         : "",
       decisionMode === "compare"
         ? "Compare mode: compare paths against what matters. Do not score, rank, or recommend."
@@ -283,6 +294,10 @@ function buildResponseGuidance(
       asksForDecisionIdeas(latestUserText)
         ? "The user is asking for ideas/options/research. Shift toward Map or Research, not another feelings-based question."
         : "",
+      asksForResearchHelp(latestUserText)
+        ? "The user is asking whether Clara can research or what facts are needed. Clara cannot do live web research yet; help prepare the research list and suggest sources or questions to check."
+        : "",
+      "Progress feedback should be concrete: 'I'm adding that under What we still don't know,' 'That belongs under Tensions,' 'That gives us a possible path,' 'That sounds like a research question,' or 'This may need facts, not more reflection.'",
       "Ask which thread the user wants to look at first.",
       "Tie the question to one visible part of the frame.",
       "Do not become a pros/cons bot, force a matrix, sound like a consultant, or recommend an option.",
@@ -349,7 +364,9 @@ function isDecisionFramePayload(value: unknown): value is DecisionFramePayload {
       "tradeoffs" in value ||
       "possiblePaths" in value ||
       "optionNotes" in value ||
-      "comparisonNotes" in value)
+      "comparisonNotes" in value ||
+      "researchQuestions" in value ||
+      "researchTasks" in value)
   );
 }
 
@@ -365,6 +382,8 @@ function isDecisionFrameUpdatePayload(value: unknown): value is DecisionFrameUpd
       "possiblePaths" in value ||
       "optionNotes" in value ||
       "comparisonNotes" in value ||
+      "researchQuestions" in value ||
+      "researchTasks" in value ||
       "currentFocus" in value ||
       "nextStep" in value ||
       "frameSummary" in value ||
@@ -443,6 +462,20 @@ function asksForDecisionIdeas(text: string) {
     /\bhow would i figure this out\b/.test(lower) ||
     /\bwhat should i research\b/.test(lower) ||
     /\bwhat do i need to find out\b/.test(lower)
+  );
+}
+
+function asksForResearchHelp(text: string) {
+  const lower = text.toLowerCase();
+
+  return (
+    /\bcan you research\b/.test(lower) ||
+    /\bcan you do the research\b/.test(lower) ||
+    /\bwhat should i research\b/.test(lower) ||
+    /\bhow do i find out\b/.test(lower) ||
+    /\bi don'?t know enough\b/.test(lower) ||
+    /\bwe need more information\b/.test(lower) ||
+    /\bwhat facts do we need\b/.test(lower)
   );
 }
 
