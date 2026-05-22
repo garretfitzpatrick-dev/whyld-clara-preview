@@ -24,11 +24,14 @@ type DecisionFramePayload = {
   question?: string;
   decisionType?: string;
   status?: string;
+  stage?: string;
+  frameSummary?: string;
   threads?: string[];
   criteria?: string[];
   tradeoffs?: string[];
   knowns?: string[];
   unknowns?: string[];
+  possiblePaths?: string[];
   currentFocus?: string | null;
   nextStep?: string | null;
 };
@@ -39,8 +42,11 @@ type DecisionFrameUpdatePayload = {
   tradeoffs?: string[];
   knowns?: string[];
   unknowns?: string[];
+  possiblePaths?: string[];
   currentFocus?: string | null;
   nextStep?: string | null;
+  frameSummary?: string | null;
+  stage?: string | null;
 };
 
 export async function POST(request: Request) {
@@ -251,6 +257,9 @@ function buildResponseGuidance(
       "Identify 2-4 pieces of what's involved, what matters, tensions, unknowns, or time horizons.",
       "Make the response feel like the shared frame is being assembled.",
       "If the latest reply added to the frame, acknowledge where it belongs: what's involved, tensions, what matters, what seems clear, what is still unknown, or next honest step.",
+      "Use this rhythm: say what the user added to the frame, briefly say why it matters, then ask the next useful question or offer to pause.",
+      "Use progress feedback such as 'I'd put that under what matters,' 'That seems like one of the big tensions,' or 'That gives the frame a clearer shape.'",
+      "If the frame is in next_step stage, help name one small next honest step instead of asking more broad questions.",
       "Ask which thread the user wants to look at first.",
       "Tie the question to one visible part of the frame.",
       "Do not become a pros/cons bot, force a matrix, sound like a consultant, or recommend an option.",
@@ -306,7 +315,14 @@ function isDecisionFramePayload(value: unknown): value is DecisionFramePayload {
   return (
     typeof value === "object" &&
     value !== null &&
-    ("question" in value || "decisionType" in value || "threads" in value || "criteria" in value || "tradeoffs" in value)
+    ("question" in value ||
+      "decisionType" in value ||
+      "stage" in value ||
+      "frameSummary" in value ||
+      "threads" in value ||
+      "criteria" in value ||
+      "tradeoffs" in value ||
+      "possiblePaths" in value)
   );
 }
 
@@ -319,8 +335,11 @@ function isDecisionFrameUpdatePayload(value: unknown): value is DecisionFrameUpd
       "tradeoffs" in value ||
       "knowns" in value ||
       "unknowns" in value ||
+      "possiblePaths" in value ||
       "currentFocus" in value ||
-      "nextStep" in value)
+      "nextStep" in value ||
+      "frameSummary" in value ||
+      "stage" in value)
   );
 }
 
