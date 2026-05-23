@@ -15,7 +15,24 @@ type SessionStatus = "active" | "closed";
 type ExpectedInput = "choice" | "text" | "none";
 type ThreadSource = "clara" | "user";
 type UserDepthSignal = "low" | "medium" | "high";
-type ConversationRoute = "moment" | "decision" | "unclear";
+type ConversationRoute =
+  | "meaning_moment"
+  | "decision_frame"
+  | "responsibility_safety"
+  | "orientation"
+  | "quest_goal"
+  | "support_witness"
+  | "unclear";
+type ArtifactType =
+  | "meaning_note"
+  | "decision_frame"
+  | "responsibility_frame"
+  | "action_checklist"
+  | "orientation_note"
+  | "quest"
+  | "goal_thread"
+  | "support_note"
+  | null;
 type UserIntent =
   | "substantive_response"
   | "acknowledgement"
@@ -229,6 +246,15 @@ type UserIntentContext = {
   userIntent: UserIntent;
   decisionFrame?: DecisionFrame | null;
   decisionFrameUpdate?: DecisionFrameUpdate | null;
+  routeClassification?: RouteClassification | null;
+};
+
+type RouteClassification = {
+  route: ConversationRoute;
+  confidence: number;
+  reason: string;
+  suggestedArtifactType: ArtifactType;
+  suggestedMode: string;
 };
 
 type MeaningNoteResponse = {
@@ -555,7 +581,7 @@ function createSession(
     userDepthSignal: "low",
     touchpointType: options.touchpointType ?? "daily_check_in",
     momentKind: options.momentKind,
-    conversationRoute: "moment",
+    conversationRoute: "meaning_moment",
     activeDecisionFrameId: null,
     awaitingRouteChoice: false
   };
@@ -1084,7 +1110,7 @@ function isStoppingSignal(text: string) {
 }
 
 function shouldCloseForDepth(session: CurrentSession, latestReply: string) {
-  if (session.conversationRoute === "decision" || session.activeDecisionFrameId) return false;
+  if (isDecisionRoute(session.conversationRoute) || session.activeDecisionFrameId) return false;
   if (isContinueSignal(latestReply)) return false;
   if (isStoppingSignal(latestReply)) return true;
   return false;
@@ -1120,14 +1146,21 @@ function maybeApplyDepthCheck(session: CurrentSession) {
 function decisionFrameTurnCount(session: CurrentSession) {
   return session.messages.filter((message) => {
     if (message.role !== "user") return false;
-    if (isMomentKind(message.text) || isReflectRouteChoice(message.text) || isThinkRouteChoice(message.text)) return false;
+    if (
+      isMomentKind(message.text) ||
+      isReflectRouteChoice(message.text) ||
+      isThinkRouteChoice(message.text) ||
+      isFindNextStepRouteChoice(message.text)
+    ) {
+      return false;
+    }
     if (isAcknowledgement(message.text) || isContinueSignal(message.text) || decisionControlChoice(message.text)) return false;
     return message.text.trim().split(/\s+/).filter(Boolean).length >= 3;
   }).length;
 }
 
 function maybeApplyDecisionPauseCheck(session: CurrentSession, frame: DecisionFrame | null) {
-  if (!frame || session.conversationRoute !== "decision") return session;
+  if (!frame || !isDecisionRoute(session.conversationRoute)) return session;
   if (frame.stage === "paused" || frame.stage === "closed" || frame.status === "closed") return session;
 
   const lastUserText = [...session.messages].reverse().find((message) => message.role === "user")?.text ?? "";
@@ -1155,7 +1188,7 @@ function maybeApplyDecisionPauseCheck(session: CurrentSession, frame: DecisionFr
 }
 
 function finalizeGeneratedSession(session: CurrentSession, frame: DecisionFrame | null) {
-  if (session.conversationRoute === "decision" || frame) {
+  if (isDecisionRoute(session.conversationRoute) || frame) {
     return maybeApplyDecisionPauseCheck(session, frame);
   }
 
@@ -1253,11 +1286,15 @@ function isNoSignal(text: string) {
 }
 
 function isReflectRouteChoice(text: string) {
-  return normalizeChoice(text) === "reflect on it";
+  return normalizeChoice(text) === "reflect" || normalizeChoice(text) === "reflect on it";
 }
 
 function isThinkRouteChoice(text: string) {
   return normalizeChoice(text) === "think it through";
+}
+
+function isFindNextStepRouteChoice(text: string) {
+  return normalizeChoice(text) === "find next step";
 }
 
 function claraAskedToSave(text: string) {
@@ -1320,7 +1357,7 @@ function emptyIntentSession(): CurrentSession {
     turnCount: 0,
     userDepthSignal: "low",
     touchpointType: "daily_check_in",
-    conversationRoute: "moment",
+    conversationRoute: "meaning_moment",
     activeDecisionFrameId: null,
     awaitingRouteChoice: false
   };
@@ -1604,6 +1641,7 @@ async function generateClaraFromConversation(
     profileMemory(profile, previousSessions),
     sessionTouchpointContext(session),
     intentContext ? `Detected user intent: ${intentContext.userIntent}` : "",
+    intentContext?.routeClassification ? routeClassificationMemory(intentContext.routeClassification) : "",
     intentContext?.decisionFrame ? decisionFrameMemory(intentContext.decisionFrame) : "",
     intentContext?.decisionFrameUpdate ? decisionFrameUpdateMemory(intentContext.decisionFrameUpdate) : ""
   ]
@@ -1617,6 +1655,7 @@ async function generateClaraFromConversation(
       memory,
       depth: session.currentDepth,
       userIntent: intentContext?.userIntent,
+      routeClassification: intentContext?.routeClassification,
       decisionFrame: intentContext?.decisionFrame,
       decisionFrameUpdate: intentContext?.decisionFrameUpdate
     });
@@ -1631,6 +1670,7 @@ async function generateClaraFromConversation(
         memory,
         depth: session.currentDepth,
         userIntent: intentContext?.userIntent,
+        routeClassification: intentContext?.routeClassification,
         decisionFrame: intentContext?.decisionFrame,
         decisionFrameUpdate: intentContext?.decisionFrameUpdate
       })
@@ -1664,6 +1704,18 @@ function fallbackConversationText(session: CurrentSession) {
 
   if (isSeriousLifeEvent(latestUser)) {
     return "I'm really sorry. That's a lot to have close to you. Do you want to say what today has been like with that in the background?";
+  }
+
+  if (isResponsibilitySafetyMoment(latestUser)) {
+    return "This sounds like it needs a responsible next step, not just reflection. What needs to be made safe or documented first?";
+  }
+
+  if (isOrientationMoment(latestUser, session)) {
+    return "Let's orient before you go in. What do you most want to protect in this?";
+  }
+
+  if (isQuestGoalMoment(latestUser)) {
+    return "That sounds like something you may want to practice over time. What would a small honest start look like?";
   }
 
   if (isCorrectionSignal(latestUser)) {
@@ -1798,6 +1850,14 @@ function isDepthChoice(text: string) {
 
 function isLightChoice(text: string) {
   return ["stay light", "leave it there", "comfort"].includes(normalizeChoice(text));
+}
+
+function isDecisionRoute(route: ConversationRoute) {
+  return route === "decision_frame";
+}
+
+function isArtifactRoute(route: ConversationRoute) {
+  return route === "meaning_moment" || route === "decision_frame";
 }
 
 type DecisionControlChoice =
@@ -2763,10 +2823,107 @@ function isLowSignalFrameReply(text: string) {
 }
 
 function routeConversationMessage(text: string, session: CurrentSession, activeFrame: DecisionFrame | null): ConversationRoute {
-  if (session.conversationRoute === "decision" || activeFrame) return "decision";
-  if (isDecisionMoment(text) || hasStrongDecisionContent(text)) return "decision";
+  if (isDecisionRoute(session.conversationRoute) || activeFrame) return "decision_frame";
+  if (isSeriousLifeEvent(text)) return "support_witness";
+  if (isResponsibilitySafetyMoment(text)) return "responsibility_safety";
+  if (isDecisionMoment(text) || hasStrongDecisionContent(text)) return "decision_frame";
+  if (isOrientationMoment(text, session)) return "orientation";
+  if (isQuestGoalMoment(text)) return "quest_goal";
   if (hasUnclearDecisionContent(text)) return "unclear";
-  return "moment";
+  return "meaning_moment";
+}
+
+function fallbackRouteClassification(text: string, session: CurrentSession, activeFrame: DecisionFrame | null): RouteClassification {
+  const route = routeConversationMessage(text, session, activeFrame);
+
+  return routeMetadata(route, route === "unclear" ? 0.48 : 0.68, "Local fallback route classification.");
+}
+
+function routeMetadata(route: ConversationRoute, confidence: number, reason: string): RouteClassification {
+  const metadata: Record<ConversationRoute, Pick<RouteClassification, "suggestedArtifactType" | "suggestedMode">> = {
+    meaning_moment: {
+      suggestedArtifactType: "meaning_note",
+      suggestedMode: "notice_what_mattered"
+    },
+    decision_frame: {
+      suggestedArtifactType: "decision_frame",
+      suggestedMode: "frame_decision"
+    },
+    responsibility_safety: {
+      suggestedArtifactType: "action_checklist",
+      suggestedMode: "responsible_action"
+    },
+    orientation: {
+      suggestedArtifactType: "orientation_note",
+      suggestedMode: "orient_before_entering"
+    },
+    quest_goal: {
+      suggestedArtifactType: "goal_thread",
+      suggestedMode: "turn_into_practice"
+    },
+    support_witness: {
+      suggestedArtifactType: null,
+      suggestedMode: "witness"
+    },
+    unclear: {
+      suggestedArtifactType: null,
+      suggestedMode: "clarify_route"
+    }
+  };
+
+  return {
+    route,
+    confidence,
+    reason,
+    ...metadata[route]
+  };
+}
+
+async function classifyRoute(
+  text: string,
+  session: CurrentSession,
+  profile: Profile | null,
+  previousSessions: CompletedSession[],
+  activeFrame: DecisionFrame | null
+): Promise<RouteClassification> {
+  if (activeFrame || isDecisionRoute(session.conversationRoute)) {
+    return routeMetadata("decision_frame", 0.96, "A Decision Frame is already active.");
+  }
+
+  try {
+    const response = await fetch("/api/clara-route", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        userText: text,
+        transcript: sessionTranscript(session, 10),
+        opener: sessionOpener(session),
+        memory: profileMemory(profile, previousSessions),
+        currentRoute: session.conversationRoute
+      })
+    });
+    const data = (await response.json()) as Partial<RouteClassification>;
+
+    if (!response.ok || !isConversationRoute(data.route)) {
+      throw new Error("Route classifier unavailable");
+    }
+
+    return {
+      ...routeMetadata(
+        data.route,
+        typeof data.confidence === "number" ? Math.min(1, Math.max(0, data.confidence)) : 0.7,
+        typeof data.reason === "string" ? data.reason : "Model route classification."
+      ),
+      suggestedArtifactType:
+        data.suggestedArtifactType === undefined ? routeMetadata(data.route, 0.7, "").suggestedArtifactType : data.suggestedArtifactType,
+      suggestedMode: typeof data.suggestedMode === "string" ? data.suggestedMode : routeMetadata(data.route, 0.7, "").suggestedMode
+    };
+  } catch (error) {
+    console.warn("Using fallback route classification", error);
+    return fallbackRouteClassification(text, session, activeFrame);
+  }
 }
 
 function hasStrongDecisionContent(text: string) {
@@ -2780,6 +2937,34 @@ function hasStrongDecisionContent(text: string) {
   return hasOptions || (hasDecisionDomain && hasUncertainty) || (hasDecisionDomain && hasTradeoff && hasFutureStakes);
 }
 
+function isResponsibilitySafetyMoment(text: string) {
+  const lower = text.toLowerCase();
+
+  return (
+    /\b(bullying|harassment|abuse|misconduct|unsafe|safety|threat|threatened|duty of care|duty-of-care)\b/.test(lower) ||
+    /\b(child|player|student|employee|kid|kids)\b.*\b(wellbeing|well-being|harm|hurt|unsafe|protect|report)\b/.test(lower) ||
+    /\b(i need to report|should i report|mandatory|responsible thing|what am i required)\b/.test(lower)
+  );
+}
+
+function isOrientationMoment(text: string, session: CurrentSession) {
+  const lower = text.toLowerCase();
+
+  return (
+    session.touchpointType === "morning_orientation" ||
+    /\b(prepare|preparing|before|about to|going into|show up|orientation|hard conversation|practice|meeting|transition)\b/.test(lower)
+  );
+}
+
+function isQuestGoalMoment(text: string) {
+  const lower = text.toLowerCase();
+
+  return (
+    /\b(goal|goals|habit|habits|aspiration|aspire|becoming|practice|growth challenge|want to become|trying to build)\b/.test(lower) &&
+    !isDecisionMoment(text)
+  );
+}
+
 function hasUnclearDecisionContent(text: string) {
   const lower = text.toLowerCase();
   const hasTension = /\b(but|however|on the other hand|balance|tension|tradeoff|trade-off|competing)\b/.test(lower);
@@ -2790,11 +2975,38 @@ function hasUnclearDecisionContent(text: string) {
 }
 
 function routeChoiceText(route: ConversationRoute) {
-  if (route === "decision") {
+  if (route === "decision_frame") {
     return "That sounds less like a moment to save and more like a decision to frame. Want to put the pieces on the table?";
   }
 
-  return "Is this something you mostly want to reflect on, or a decision you're trying to think through?";
+  return "Do you want to reflect on this, think it through, or figure out what to do next?";
+}
+
+function routeClassificationMemory(classification: RouteClassification) {
+  return [
+    "High-level Clara route:",
+    `Route: ${classification.route}`,
+    `Confidence: ${classification.confidence.toFixed(2)}`,
+    `Reason: ${classification.reason}`,
+    `Likely user need: ${routeUserNeed(classification.route)}`,
+    `Suggested artifact: ${classification.suggestedArtifactType ?? "none"}`,
+    `Suggested Clara behavior mode: ${classification.suggestedMode}`,
+    "Use this route under the hood. Do not announce the route name to the user."
+  ].join("\n");
+}
+
+function routeUserNeed(route: ConversationRoute) {
+  const needs: Record<ConversationRoute, string> = {
+    meaning_moment: "notice what mattered",
+    decision_frame: "frame the question",
+    responsibility_safety: "act responsibly",
+    orientation: "orient before entering",
+    quest_goal: "turn meaning into practice",
+    support_witness: "be met with presence, not pushed into solving",
+    unclear: "clarify what kind of help is needed"
+  };
+
+  return needs[route];
 }
 
 function decisionFrameUpdateMemory(update: DecisionFrameUpdate) {
@@ -2877,6 +3089,7 @@ function latestSubstantiveUserText(session: CurrentSession) {
           !isMomentKind(message.text) &&
           !isReflectRouteChoice(message.text) &&
           !isThinkRouteChoice(message.text) &&
+          !isFindNextStepRouteChoice(message.text) &&
           !isAcknowledgement(message.text)
       )?.text ?? ""
   );
@@ -3101,7 +3314,21 @@ function isDecisionMode(value: unknown): value is DecisionMode {
 }
 
 function isConversationRoute(value: unknown): value is ConversationRoute {
-  return value === "moment" || value === "decision" || value === "unclear";
+  return (
+    value === "meaning_moment" ||
+    value === "decision_frame" ||
+    value === "responsibility_safety" ||
+    value === "orientation" ||
+    value === "quest_goal" ||
+    value === "support_witness" ||
+    value === "unclear"
+  );
+}
+
+function normalizeConversationRoute(value: unknown): ConversationRoute {
+  if (value === "moment") return "meaning_moment";
+  if (value === "decision") return "decision_frame";
+  return isConversationRoute(value) ? value : "meaning_moment";
 }
 
 function isMomentKind(value: unknown): value is MomentKind {
@@ -3333,9 +3560,7 @@ function normalizeSession(session: CurrentSession): CurrentSession {
       typeof (session as CurrentSession & { eventType?: unknown }).eventType === "string"
         ? (session as CurrentSession & { eventType: string }).eventType
         : undefined,
-    conversationRoute: isConversationRoute((session as CurrentSession & { conversationRoute?: unknown }).conversationRoute)
-      ? (session as CurrentSession & { conversationRoute: ConversationRoute }).conversationRoute
-      : "moment",
+    conversationRoute: normalizeConversationRoute((session as CurrentSession & { conversationRoute?: unknown }).conversationRoute),
     activeDecisionFrameId:
       typeof (session as CurrentSession & { activeDecisionFrameId?: unknown }).activeDecisionFrameId === "string"
         ? (session as CurrentSession & { activeDecisionFrameId: string }).activeDecisionFrameId
@@ -3464,7 +3689,7 @@ function legacyEntriesToSessions(entries: LegacyEntry[]): CompletedSession[] {
     turnCount: 1,
     userDepthSignal: inferUserDepthSignal(entry.response),
     touchpointType: "daily_check_in",
-    conversationRoute: "moment",
+    conversationRoute: "meaning_moment",
     activeDecisionFrameId: null,
     awaitingRouteChoice: false,
     tags: entry.tags,
@@ -3650,7 +3875,7 @@ export default function Home() {
       if (isReflectRouteChoice(trimmed) || (isNoSignal(trimmed) && currentSession.conversationRoute === "unclear")) {
         const sessionWithChoice: CurrentSession = {
           ...currentSession,
-          conversationRoute: "moment",
+          conversationRoute: "meaning_moment",
           awaitingRouteChoice: false,
           messages: [
             ...currentSession.messages,
@@ -3666,12 +3891,31 @@ export default function Home() {
         return;
       }
 
+      if (isFindNextStepRouteChoice(trimmed)) {
+        const sessionWithChoice: CurrentSession = {
+          ...currentSession,
+          conversationRoute: "responsibility_safety",
+          awaitingRouteChoice: false,
+          messages: [
+            ...currentSession.messages,
+            makeUserMessage(trimmed),
+            makeClaraMessage({
+              text: "Okay. Let's make this practical. What feels like the first responsible next step?",
+              expectedInput: "text"
+            })
+          ]
+        };
+        setCurrentSession(sessionWithChoice);
+        setAnswer("");
+        return;
+      }
+
       if (isThinkRouteChoice(trimmed) || isYesSignal(trimmed)) {
         const frameText = latestSubstantiveUserText(currentSession) || sessionText(currentSession) || trimmed;
         const frame = decisionFrameFromText(frameText, currentSession);
         const sessionWithFrame: CurrentSession = {
           ...currentSession,
-          conversationRoute: "decision",
+          conversationRoute: "decision_frame",
           activeDecisionFrameId: frame.id,
           awaitingRouteChoice: false,
           messages: [...currentSession.messages, makeUserMessage(trimmed)]
@@ -3724,7 +3968,7 @@ export default function Home() {
       };
       const sessionWithChoice: CurrentSession = {
         ...currentSession,
-        conversationRoute: "decision",
+        conversationRoute: "decision_frame",
         activeDecisionFrameId: updatedFrame.id,
         messages: [...currentSession.messages, makeUserMessage(trimmed)]
       };
@@ -3755,7 +3999,7 @@ export default function Home() {
 
     const detectedUserIntent = detectUserIntent(trimmed, currentSession);
     const currentlyInDecisionLoop =
-      currentSession.conversationRoute === "decision" || activeDecisionFrameForSession(decisionFrames, currentSession) !== null;
+      isDecisionRoute(currentSession.conversationRoute) || activeDecisionFrameForSession(decisionFrames, currentSession) !== null;
     console.log("detectedUserIntent", detectedUserIntent);
 
     if (detectedUserIntent === "polite_close") {
@@ -3821,7 +4065,9 @@ export default function Home() {
       messages: [...currentSession.messages, userMessage]
     };
     const existingDecisionFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
-    const routedAs = routeConversationMessage(trimmed, currentSession, existingDecisionFrame);
+    const routeClassification = await classifyRoute(trimmed, sessionWithReply, profile, sessions, existingDecisionFrame);
+    const routedAs = routeClassification.route;
+    console.log("Clara route classification", routeClassification);
 
     if (routedAs === "unclear") {
       setCurrentSession({
@@ -3833,7 +4079,7 @@ export default function Home() {
           makeClaraMessage({
             text: routeChoiceText("unclear"),
             expectedInput: "choice",
-            choices: ["Reflect on it", "Think it through"]
+            choices: ["Reflect", "Think it through", "Find next step"]
           })
         ]
       });
@@ -3841,7 +4087,8 @@ export default function Home() {
       return;
     }
 
-    const newDecisionFrame = routedAs === "decision" && !existingDecisionFrame ? decisionFrameFromText(trimmed, sessionWithReply) : null;
+    const newDecisionFrame =
+      routedAs === "decision_frame" && !existingDecisionFrame ? decisionFrameFromText(trimmed, sessionWithReply) : null;
     let decisionFrame = newDecisionFrame ?? existingDecisionFrame;
     let decisionFrameUpdate: DecisionFrameUpdate | null = null;
     let routedSession: CurrentSession = {
@@ -3891,7 +4138,8 @@ export default function Home() {
       const claraResult = await generateClaraFromConversation(redirectedSession, profile, sessions, {
         userIntent: detectedUserIntent,
         decisionFrame,
-        decisionFrameUpdate
+        decisionFrameUpdate,
+        routeClassification
       });
       setCurrentSession(
         finalizeGeneratedSession(
@@ -3916,7 +4164,8 @@ export default function Home() {
       const claraResult = await generateClaraFromConversation(routedSession, profile, sessions, {
         userIntent: detectedUserIntent,
         decisionFrame,
-        decisionFrameUpdate
+        decisionFrameUpdate,
+        routeClassification
       });
       setCurrentSession(
         finalizeGeneratedSession(
@@ -3941,7 +4190,8 @@ export default function Home() {
     const claraResult = await generateClaraFromConversation(routedSession, profile, sessions, {
       userIntent: detectedUserIntent,
       decisionFrame,
-      decisionFrameUpdate
+      decisionFrameUpdate,
+      routeClassification
     });
     setCurrentSession(
       finalizeGeneratedSession(
@@ -4143,7 +4393,7 @@ export default function Home() {
     if (!currentSession) return;
 
     const activeFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
-    const isDecisionSession = currentSession.conversationRoute === "decision" || activeFrame !== null;
+    const isDecisionSession = isDecisionRoute(currentSession.conversationRoute) || activeFrame !== null;
     const finalClaraText =
       claraText ?? (isDecisionSession ? "Saved. You can come back to this from Frames." : "That's a good place to leave it for today.");
     const now = new Date().toISOString();
@@ -4187,6 +4437,10 @@ export default function Home() {
         const updatedFrame = updateDecisionFrameSourceSummary(pausedFrame, closedSession, choiceText ?? "");
         setDecisionFrames((current) => current.map((frame) => (frame.id === updatedFrame.id ? updatedFrame : frame)));
       }
+      return;
+    }
+
+    if (currentSession.conversationRoute !== "meaning_moment") {
       return;
     }
 
@@ -4373,7 +4627,7 @@ export default function Home() {
           choices: decisionResumeChoices
         })
       ],
-      conversationRoute: "decision",
+      conversationRoute: "decision_frame",
       activeDecisionFrameId: resumedFrame.id,
       awaitingRouteChoice: false
     });
@@ -4391,7 +4645,7 @@ export default function Home() {
     setDecisionFrames((current) => current.map((frame) => (frame.id === updatedFrame.id ? updatedFrame : frame)));
     setCurrentSession({
       ...currentSession,
-      conversationRoute: "decision",
+      conversationRoute: "decision_frame",
       activeDecisionFrameId: updatedFrame.id
     });
   }

@@ -13,11 +13,20 @@ type LabRequest = {
   memory?: string;
   depth?: string;
   userIntent?: UserIntent;
+  routeClassification?: RouteClassificationPayload;
   decisionFrame?: DecisionFramePayload;
   decisionFrameUpdate?: DecisionFrameUpdatePayload;
   model?: string;
   temperature?: number;
   maxTokens?: number;
+};
+
+type RouteClassificationPayload = {
+  route?: string;
+  confidence?: number;
+  reason?: string;
+  suggestedArtifactType?: string | null;
+  suggestedMode?: string;
 };
 
 type DecisionFramePayload = {
@@ -82,12 +91,13 @@ export async function POST(request: Request) {
   const memory = body.memory?.trim() ?? "";
   const depth = body.depth?.trim() ?? "";
   const userIntent = isUserIntent(body.userIntent) ? body.userIntent : detectUserIntentFromTranscript(transcript);
+  const routeClassification = isRouteClassificationPayload(body.routeClassification) ? body.routeClassification : null;
   const decisionFrame = isDecisionFramePayload(body.decisionFrame) ? body.decisionFrame : null;
   const decisionFrameUpdate = isDecisionFrameUpdatePayload(body.decisionFrameUpdate) ? body.decisionFrameUpdate : null;
   const model = body.model?.trim() || CLARA_MODEL;
   const temperature = clampNumber(body.temperature, 0, 2, CLARA_DEFAULT_TEMPERATURE);
   const maxTokens = Math.round(clampNumber(body.maxTokens, 40, 800, CLARA_DEFAULT_MAX_TOKENS));
-  const responseGuidance = buildResponseGuidance(transcript, userIntent, depth, memory, decisionFrame);
+  const responseGuidance = buildResponseGuidance(transcript, userIntent, depth, memory, decisionFrame, routeClassification);
   const userPrompt = buildLabUserPrompt({
     task,
     transcript,
@@ -95,6 +105,7 @@ export async function POST(request: Request) {
     memory,
     depth,
     responseGuidance,
+    routeClassification,
     decisionFrame,
     decisionFrameUpdate
   });
@@ -180,10 +191,12 @@ function buildLabUserPrompt({
   memory,
   depth,
   responseGuidance,
+  routeClassification,
   decisionFrame,
   decisionFrameUpdate
 }: Pick<Required<LabRequest>, "task" | "transcript" | "opener" | "memory" | "depth"> & {
   responseGuidance: ResponseGuidance;
+  routeClassification: RouteClassificationPayload | null;
   decisionFrame: DecisionFramePayload | null;
   decisionFrameUpdate: DecisionFrameUpdatePayload | null;
 }) {
@@ -194,6 +207,7 @@ function buildLabUserPrompt({
       memory,
       depth,
       responseGuidance,
+      routeClassification,
       decisionFrame,
       decisionFrameUpdate,
       transcript
@@ -222,6 +236,7 @@ type ResponseGuidance = {
   userIntent: UserIntent;
   seriousLifeEvent: boolean;
   decisionMoment: boolean;
+  route?: string;
   continueRequested: boolean;
   recentQuestionLedReplies: number;
   instructions: string[];
@@ -232,12 +247,17 @@ function buildResponseGuidance(
   userIntent: UserIntent,
   depth: string,
   memory: string,
-  decisionFrame: DecisionFramePayload | null
+  decisionFrame: DecisionFramePayload | null,
+  routeClassification: RouteClassificationPayload | null
 ): ResponseGuidance {
   const latestUserText = latestUserLine(transcript);
   const seriousLifeEvent = isSeriousLifeEvent(latestUserText);
+  const route = routeClassification?.route;
   const decisionMoment =
-    decisionFrame !== null || isDecisionMoment(latestUserText) || memory.toLowerCase().includes("decision frame v1");
+    route === "decision_frame" ||
+    decisionFrame !== null ||
+    isDecisionMoment(latestUserText) ||
+    memory.toLowerCase().includes("decision frame v1");
   const decisionMode = decisionFrame?.currentDecisionMode;
   const continueRequested = userIntent === "explicit_continue" || isContinueSignal(latestUserText);
   const recentQuestionLedReplies = countRecentQuestionLedClaraReplies(transcript);
@@ -258,13 +278,41 @@ function buildResponseGuidance(
   } else if (userIntent === "ambiguous_response") {
     suggestedMove = "gentle_question";
     instructions.push("The user gave an ambiguous yes/no answer to a choice. Clarify the choice plainly.");
-  } else if (seriousLifeEvent) {
+  } else if (route === "support_witness" || seriousLifeEvent) {
     suggestedMove = "witness";
     instructions.push(
       "Serious life event detected. Respond with immediate warmth and gravity.",
       "Do not use generic flow-control language.",
       "Do not ask whether the user wants to stay with this.",
       "Do not rush to save or close."
+    );
+  } else if (route === "responsibility_safety") {
+    suggestedMove = "gentle_question";
+    instructions.push(
+      "High-level route: responsibility_safety.",
+      "The user likely needs to act responsibly around safety, duty-of-care, misconduct, bullying, harassment, or wellbeing.",
+      "Be calm and concrete. Prioritize immediate safety, documentation, appropriate escalation, and not handling serious issues alone.",
+      "Do not turn this into a meaning reflection."
+    );
+  } else if (route === "orientation") {
+    suggestedMove = "gentle_question";
+    instructions.push(
+      "High-level route: orientation.",
+      "The user likely needs to orient before entering something.",
+      "Help clarify purpose, role, tone, and one thing to protect. Keep it brief and practical."
+    );
+  } else if (route === "quest_goal") {
+    suggestedMove = "gentle_question";
+    instructions.push(
+      "High-level route: quest_goal.",
+      "The user likely wants to turn meaning into practice, a habit, or a growth thread.",
+      "Help make the aspiration concrete without overbuilding a full plan."
+    );
+  } else if (route === "unclear") {
+    suggestedMove = "gentle_question";
+    instructions.push(
+      "High-level route: unclear.",
+      "Ask one simple routing question: whether they want to reflect, think it through, or figure out what to do next."
     );
   } else if (decisionMoment) {
     suggestedMove = "frame_decision";
@@ -344,6 +392,7 @@ function buildResponseGuidance(
     userIntent,
     seriousLifeEvent,
     decisionMoment,
+    route,
     continueRequested,
     recentQuestionLedReplies,
     instructions
@@ -368,6 +417,10 @@ function isDecisionFramePayload(value: unknown): value is DecisionFramePayload {
       "researchQuestions" in value ||
       "researchTasks" in value)
   );
+}
+
+function isRouteClassificationPayload(value: unknown): value is RouteClassificationPayload {
+  return typeof value === "object" && value !== null && "route" in value;
 }
 
 function isDecisionFrameUpdatePayload(value: unknown): value is DecisionFrameUpdatePayload {
