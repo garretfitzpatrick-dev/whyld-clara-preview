@@ -14,6 +14,7 @@ type ArtifactType =
   | "meaning_note"
   | "decision_frame"
   | "responsibility_frame"
+  | "responsibility_plan"
   | "action_checklist"
   | "orientation_note"
   | "quest"
@@ -45,14 +46,14 @@ Return only JSON:
   "route": "meaning_moment" | "decision_frame" | "responsibility_safety" | "orientation" | "quest_goal" | "support_witness" | "unclear",
   "confidence": 0.0-1.0,
   "reason": "brief internal reason",
-  "suggestedArtifactType": "meaning_note" | "decision_frame" | "responsibility_frame" | "action_checklist" | "orientation_note" | "quest" | "goal_thread" | "support_note" | null,
+  "suggestedArtifactType": "meaning_note" | "decision_frame" | "responsibility_frame" | "responsibility_plan" | "action_checklist" | "orientation_note" | "quest" | "goal_thread" | "support_note" | null,
   "suggestedMode": "plain behavior mode"
 }
 
 Routes:
 - meaning_moment: ordinary experiences, reflections, positive/negative moments, daily check-ins. User need: notice what mattered. Artifact: meaning_note.
 - decision_frame: messy choices, tradeoffs, should I/we, how should I think about this, moving/job/school/goals decisions. User need: frame the question. Artifact: decision_frame.
-- responsibility_safety: safety, bullying, harassment, duty-of-care, misconduct, child/player/student/employee wellbeing, immediate action responsibility. User need: act responsibly. Artifact: action_checklist or responsibility_frame.
+- responsibility_safety: safety, bullying, harassment, duty-of-care, misconduct, child/player/student/employee wellbeing, immediate action responsibility. User need: act responsibly. Artifact: responsibility_plan.
 - orientation: preparing for something: meeting, practice, hard conversation, day, transition. User need: orient before entering. Artifact: orientation_note.
 - quest_goal: aspirations, goals, habits, becoming, growth challenges. User need: turn meaning into practice. Artifact: quest or goal_thread.
 - support_witness: grief, illness, overwhelm, sadness, bad news, emotional heaviness. User need: be met with presence, not pushed into solving. Artifact: usually null.
@@ -61,6 +62,7 @@ Routes:
 Rules:
 - Classify the user need, not just keywords.
 - If safety/duty-of-care/wellbeing responsibility is present, prefer responsibility_safety over meaning_moment.
+- If the user asks what to do, asks for advice/guidance, or needs a concrete next step in a responsibility_safety situation, use suggestedMode "action_plan".
 - If grief, illness, loss, bad news, or emotional heaviness is central, prefer support_witness unless the user clearly asks for action.
 - If there is a messy choice or tradeoff about what to do, prefer decision_frame.
 - If the user is preparing to enter a situation, prefer orientation.
@@ -157,8 +159,17 @@ function extractJsonObject(text: string) {
 function fallbackRoute(text: string): RouteClassification {
   const lower = text.toLowerCase();
 
-  if (/\b(bullying|harassment|abuse|misconduct|unsafe|safety|threat|duty of care|report)\b/.test(lower)) {
-    return { route: "responsibility_safety", confidence: 0.66, reason: "Safety or duty-of-care language.", ...routeMetadata("responsibility_safety") };
+  if (
+    /\b(bullying|harassment|abuse|misconduct|unsafe|safety|threat|duty of care|report)\b/.test(lower) ||
+    (isResponsibilityActionRequest(text) &&
+      /\b(league|president|coach|player|parent|guardian|school|student|principal|hr|employee|policy|safeguarding)\b/.test(lower))
+  ) {
+    return {
+      route: "responsibility_safety",
+      confidence: 0.66,
+      reason: "Safety or duty-of-care language.",
+      ...routeMetadata("responsibility_safety", isResponsibilityActionRequest(text))
+    };
   }
 
   if (/\b(dying|death|grief|cancer|very sick|terrible news|overwhelmed|devastated)\b/.test(lower)) {
@@ -184,11 +195,28 @@ function fallbackRoute(text: string): RouteClassification {
   return { route: "meaning_moment", confidence: 0.6, reason: "Ordinary moment or reflection.", ...routeMetadata("meaning_moment") };
 }
 
-function routeMetadata(route: ClaraRoute): Pick<RouteClassification, "suggestedArtifactType" | "suggestedMode"> {
+function isResponsibilityActionRequest(text: string) {
+  const lower = text.toLowerCase();
+
+  return (
+    /\bwhat should (i|we) do\b/.test(lower) ||
+    /\bwhat should (i|we) do first\b/.test(lower) ||
+    /\bwhat do (i|we) do (first|next|now)\b/.test(lower) ||
+    /\bi just want to know what (i|we) should do next\b/.test(lower) ||
+    /\bdo you have advice\b/.test(lower) ||
+    /\bany advice\b/.test(lower) ||
+    /\bi need (advice|guidance|to handle this|to deal with this)\b/.test(lower) ||
+    /\bi need to (talk to|contact|call|email|message|loop in)\b.*\b(president|director|principal|coach|parent|guardian|hr|admin|leader|supervisor)\b/.test(
+      lower
+    )
+  );
+}
+
+function routeMetadata(route: ClaraRoute, actionPlan = false): Pick<RouteClassification, "suggestedArtifactType" | "suggestedMode"> {
   const metadata: Record<ClaraRoute, Pick<RouteClassification, "suggestedArtifactType" | "suggestedMode">> = {
     meaning_moment: { suggestedArtifactType: "meaning_note", suggestedMode: "notice_what_mattered" },
     decision_frame: { suggestedArtifactType: "decision_frame", suggestedMode: "frame_decision" },
-    responsibility_safety: { suggestedArtifactType: "action_checklist", suggestedMode: "responsible_action" },
+    responsibility_safety: { suggestedArtifactType: "responsibility_plan", suggestedMode: actionPlan ? "action_plan" : "responsible_action" },
     orientation: { suggestedArtifactType: "orientation_note", suggestedMode: "orient_before_entering" },
     quest_goal: { suggestedArtifactType: "goal_thread", suggestedMode: "turn_into_practice" },
     support_witness: { suggestedArtifactType: null, suggestedMode: "witness" },
@@ -216,6 +244,7 @@ function isArtifactType(value: unknown): value is ArtifactType {
     value === "meaning_note" ||
     value === "decision_frame" ||
     value === "responsibility_frame" ||
+    value === "responsibility_plan" ||
     value === "action_checklist" ||
     value === "orientation_note" ||
     value === "quest" ||

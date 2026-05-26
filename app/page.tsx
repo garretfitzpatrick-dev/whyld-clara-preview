@@ -27,6 +27,7 @@ type ArtifactType =
   | "meaning_note"
   | "decision_frame"
   | "responsibility_frame"
+  | "responsibility_plan"
   | "action_checklist"
   | "orientation_note"
   | "quest"
@@ -58,6 +59,7 @@ type DecisionFrameStatus = "open" | "closed";
 type DecisionFrameStage = "opening" | "mapping" | "clarifying" | "next_step" | "paused" | "closed";
 type DecisionMode = "reflect" | "map" | "research" | "compare" | "act";
 type ResearchTaskStatus = "open" | "done";
+type ResponsibilityPlanStatus = "open" | "monitoring" | "resolved";
 type ResponseStrategy =
   | "acknowledge"
   | "reflect"
@@ -120,6 +122,7 @@ type CurrentSession = {
   eventType?: string;
   conversationRoute: ConversationRoute;
   activeDecisionFrameId: string | null;
+  activeResponsibilityPlanId: string | null;
   awaitingRouteChoice: boolean;
 };
 
@@ -193,6 +196,21 @@ type DecisionFrameUpdate = {
   currentDecisionMode: DecisionMode | null;
 };
 
+type ResponsibilityPlan = {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  sourceSessionId: string | null;
+  issue: string;
+  role: string;
+  immediateConcern: string;
+  nextSteps: string[];
+  peopleToContact: string[];
+  policiesToCheck: string[];
+  communicationsToDraft: string[];
+  status: ResponsibilityPlanStatus;
+};
+
 type LegacyEntry = {
   id: string;
   createdAt: string;
@@ -246,6 +264,7 @@ type UserIntentContext = {
   userIntent: UserIntent;
   decisionFrame?: DecisionFrame | null;
   decisionFrameUpdate?: DecisionFrameUpdate | null;
+  responsibilityPlan?: ResponsibilityPlan | null;
   routeClassification?: RouteClassification | null;
 };
 
@@ -298,7 +317,8 @@ const STORAGE_KEYS = {
   sessions: "whyld-world-clara-sessions",
   legacyEntries: "whyld-world-clara-entries",
   meaningNotes: "whyld-world-clara-meaning-notes",
-  decisionFrames: "whyld-world-clara-decision-frames"
+  decisionFrames: "whyld-world-clara-decision-frames",
+  responsibilityPlans: "whyld-world-clara-responsibility-plans"
 };
 
 const APP_STORAGE_PREFIXES = ["whyld-world-", "whyld-", "clara-"];
@@ -583,6 +603,7 @@ function createSession(
     momentKind: options.momentKind,
     conversationRoute: "meaning_moment",
     activeDecisionFrameId: null,
+    activeResponsibilityPlanId: null,
     awaitingRouteChoice: false
   };
 }
@@ -1111,6 +1132,7 @@ function isStoppingSignal(text: string) {
 
 function shouldCloseForDepth(session: CurrentSession, latestReply: string) {
   if (isDecisionRoute(session.conversationRoute) || session.activeDecisionFrameId) return false;
+  if (session.conversationRoute === "responsibility_safety" || session.activeResponsibilityPlanId) return false;
   if (isContinueSignal(latestReply)) return false;
   if (isStoppingSignal(latestReply)) return true;
   return false;
@@ -1190,6 +1212,10 @@ function maybeApplyDecisionPauseCheck(session: CurrentSession, frame: DecisionFr
 function finalizeGeneratedSession(session: CurrentSession, frame: DecisionFrame | null) {
   if (isDecisionRoute(session.conversationRoute) || frame) {
     return maybeApplyDecisionPauseCheck(session, frame);
+  }
+
+  if (session.conversationRoute === "responsibility_safety" || session.activeResponsibilityPlanId) {
+    return session;
   }
 
   return maybeApplyDepthCheck(session);
@@ -1359,6 +1385,7 @@ function emptyIntentSession(): CurrentSession {
     touchpointType: "daily_check_in",
     conversationRoute: "meaning_moment",
     activeDecisionFrameId: null,
+    activeResponsibilityPlanId: null,
     awaitingRouteChoice: false
   };
 }
@@ -1643,7 +1670,8 @@ async function generateClaraFromConversation(
     intentContext ? `Detected user intent: ${intentContext.userIntent}` : "",
     intentContext?.routeClassification ? routeClassificationMemory(intentContext.routeClassification) : "",
     intentContext?.decisionFrame ? decisionFrameMemory(intentContext.decisionFrame) : "",
-    intentContext?.decisionFrameUpdate ? decisionFrameUpdateMemory(intentContext.decisionFrameUpdate) : ""
+    intentContext?.decisionFrameUpdate ? decisionFrameUpdateMemory(intentContext.decisionFrameUpdate) : "",
+    intentContext?.responsibilityPlan ? responsibilityPlanMemory(intentContext.responsibilityPlan) : ""
   ]
     .filter(Boolean)
     .join("\n");
@@ -1657,7 +1685,8 @@ async function generateClaraFromConversation(
       userIntent: intentContext?.userIntent,
       routeClassification: intentContext?.routeClassification,
       decisionFrame: intentContext?.decisionFrame,
-      decisionFrameUpdate: intentContext?.decisionFrameUpdate
+      decisionFrameUpdate: intentContext?.decisionFrameUpdate,
+      responsibilityPlan: intentContext?.responsibilityPlan
     });
     const response = await fetch("/api/clara-lab", {
       method: "POST",
@@ -1707,7 +1736,7 @@ function fallbackConversationText(session: CurrentSession) {
   }
 
   if (isResponsibilitySafetyMoment(latestUser)) {
-    return "This sounds like it needs a responsible next step, not just reflection. What needs to be made safe or documented first?";
+    return fallbackResponsibilityPlanText(latestUser, session);
   }
 
   if (isOrientationMoment(latestUser, session)) {
@@ -1739,6 +1768,21 @@ function fallbackConversationText(session: CurrentSession) {
   }
 
   return "That makes sense. What part of that feels closest right now?";
+}
+
+function fallbackResponsibilityPlanText(latestUser: string, session: CurrentSession) {
+  const plan = responsibilityPlanFromText(latestUser, session);
+  const steps = plan.nextSteps
+    .slice(0, 6)
+    .map((step, index) => `${index + 1}. ${step}`)
+    .join("\n");
+
+  return [
+    "This sounds like a safety/responsibility issue, so I'd make the next step procedural rather than reflective.",
+    steps,
+    "I'm not a lawyer or investigator, so use the policy as the anchor. If there is serious harm, threats, abuse, or ongoing danger, don't handle it alone.",
+    "Want help drafting the first message?"
+  ].join("\n\n");
 }
 
 function fallbackClaraText(intent: ResponseIntent) {
@@ -1827,7 +1871,7 @@ function fallbackClaraText(intent: ResponseIntent) {
 }
 
 function isSaveChoice(text: string) {
-  return ["save this", "save it", "mark that", "keep it close"].includes(normalizeChoice(text));
+  return ["save this", "save it", "save the plan", "save this as the plan", "mark that", "keep it close"].includes(normalizeChoice(text));
 }
 
 function isCloseChoice(text: string) {
@@ -2824,6 +2868,7 @@ function isLowSignalFrameReply(text: string) {
 
 function routeConversationMessage(text: string, session: CurrentSession, activeFrame: DecisionFrame | null): ConversationRoute {
   if (isDecisionRoute(session.conversationRoute) || activeFrame) return "decision_frame";
+  if (session.conversationRoute === "responsibility_safety") return "responsibility_safety";
   if (isSeriousLifeEvent(text)) return "support_witness";
   if (isResponsibilitySafetyMoment(text)) return "responsibility_safety";
   if (isDecisionMoment(text) || hasStrongDecisionContent(text)) return "decision_frame";
@@ -2850,7 +2895,7 @@ function routeMetadata(route: ConversationRoute, confidence: number, reason: str
       suggestedMode: "frame_decision"
     },
     responsibility_safety: {
-      suggestedArtifactType: "action_checklist",
+      suggestedArtifactType: "responsibility_plan",
       suggestedMode: "responsible_action"
     },
     orientation: {
@@ -2890,6 +2935,14 @@ async function classifyRoute(
     return routeMetadata("decision_frame", 0.96, "A Decision Frame is already active.");
   }
 
+  if (session.conversationRoute === "responsibility_safety") {
+    return withResponsibilityActionMode(
+      routeMetadata("responsibility_safety", 0.95, "A responsibility/safety loop is already active."),
+      text,
+      session
+    );
+  }
+
   try {
     const response = await fetch("/api/clara-route", {
       method: "POST",
@@ -2910,7 +2963,7 @@ async function classifyRoute(
       throw new Error("Route classifier unavailable");
     }
 
-    return {
+    return withResponsibilityActionMode({
       ...routeMetadata(
         data.route,
         typeof data.confidence === "number" ? Math.min(1, Math.max(0, data.confidence)) : 0.7,
@@ -2919,10 +2972,10 @@ async function classifyRoute(
       suggestedArtifactType:
         data.suggestedArtifactType === undefined ? routeMetadata(data.route, 0.7, "").suggestedArtifactType : data.suggestedArtifactType,
       suggestedMode: typeof data.suggestedMode === "string" ? data.suggestedMode : routeMetadata(data.route, 0.7, "").suggestedMode
-    };
+    }, text, session);
   } catch (error) {
     console.warn("Using fallback route classification", error);
-    return fallbackRouteClassification(text, session, activeFrame);
+    return withResponsibilityActionMode(fallbackRouteClassification(text, session, activeFrame), text, session);
   }
 }
 
@@ -2943,7 +2996,209 @@ function isResponsibilitySafetyMoment(text: string) {
   return (
     /\b(bullying|harassment|abuse|misconduct|unsafe|safety|threat|threatened|duty of care|duty-of-care)\b/.test(lower) ||
     /\b(child|player|student|employee|kid|kids)\b.*\b(wellbeing|well-being|harm|hurt|unsafe|protect|report)\b/.test(lower) ||
-    /\b(i need to report|should i report|mandatory|responsible thing|what am i required)\b/.test(lower)
+    /\b(i need to report|should i report|mandatory|responsible thing|what am i required)\b/.test(lower) ||
+    (isResponsibilityActionRequest(text) &&
+      /\b(league|president|coach|player|parent|guardian|school|student|principal|hr|employee|policy|safeguarding)\b/.test(lower))
+  );
+}
+
+function isResponsibilityActionRequest(text: string) {
+  const lower = text.toLowerCase();
+
+  return (
+    /\bwhat should (i|we) do\b/.test(lower) ||
+    /\bwhat should (i|we) do first\b/.test(lower) ||
+    /\bwhat do (i|we) do (first|next|now)\b/.test(lower) ||
+    /\bi just want to know what (i|we) should do next\b/.test(lower) ||
+    /\bdo you have advice\b/.test(lower) ||
+    /\bany advice\b/.test(lower) ||
+    /\bi need (advice|guidance|to handle this|to deal with this)\b/.test(lower) ||
+    /\bi need to (talk to|contact|call|email|message|loop in)\b.*\b(president|director|principal|coach|parent|guardian|hr|admin|leader|supervisor)\b/.test(
+      lower
+    )
+  );
+}
+
+function responsibilitySuggestedMode(text: string, session: CurrentSession) {
+  if (isResponsibilityActionRequest(text)) return "action_plan";
+  if (session.conversationRoute === "responsibility_safety" && !isLowSignalFrameReply(text)) return "action_plan";
+
+  const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
+  if (wordCount >= 10 && isResponsibilitySafetyMoment(text)) return "action_plan";
+
+  return "responsible_action";
+}
+
+function withResponsibilityActionMode(
+  classification: RouteClassification,
+  text: string,
+  session: CurrentSession
+): RouteClassification {
+  if (classification.route !== "responsibility_safety") return classification;
+
+  return {
+    ...classification,
+    suggestedArtifactType: "responsibility_plan",
+    suggestedMode: responsibilitySuggestedMode(text, session)
+  };
+}
+
+function responsibilityPlanFromText(text: string, session: CurrentSession): ResponsibilityPlan {
+  const combinedText = [sessionText(session), text].filter(Boolean).join(" ");
+  const now = new Date().toISOString();
+  const peopleToContact = inferResponsibilityPeople(combinedText);
+  const policiesToCheck = inferResponsibilityPolicies(combinedText);
+  const nextSteps = inferResponsibilityNextSteps(combinedText, peopleToContact, policiesToCheck);
+
+  return {
+    id: crypto.randomUUID(),
+    createdAt: now,
+    updatedAt: now,
+    sourceSessionId: session.sessionId,
+    issue: inferResponsibilityIssue(combinedText, text),
+    role: inferResponsibilityRole(combinedText),
+    immediateConcern: inferResponsibilityConcern(combinedText),
+    nextSteps,
+    peopleToContact,
+    policiesToCheck,
+    communicationsToDraft: inferResponsibilityMessages(combinedText, peopleToContact),
+    status: "open"
+  };
+}
+
+function mergeResponsibilityPlan(existing: ResponsibilityPlan, inferred: ResponsibilityPlan): ResponsibilityPlan {
+  return {
+    ...existing,
+    updatedAt: new Date().toISOString(),
+    issue: existing.issue || inferred.issue,
+    role: existing.role || inferred.role,
+    immediateConcern: existing.immediateConcern || inferred.immediateConcern,
+    nextSteps: uniqueStrings([...existing.nextSteps, ...inferred.nextSteps]).slice(0, 8),
+    peopleToContact: uniqueStrings([...existing.peopleToContact, ...inferred.peopleToContact]).slice(0, 8),
+    policiesToCheck: uniqueStrings([...existing.policiesToCheck, ...inferred.policiesToCheck]).slice(0, 6),
+    communicationsToDraft: uniqueStrings([...existing.communicationsToDraft, ...inferred.communicationsToDraft]).slice(0, 6),
+    status: existing.status === "resolved" ? "monitoring" : existing.status
+  };
+}
+
+function inferResponsibilityIssue(combinedText: string, latestText: string) {
+  const lower = combinedText.toLowerCase();
+  if (/\b(tee ball|baseball|player|coach|league)\b/.test(lower) && /\b(bully|bullying|safety|unsafe|harm|hurt)\b/.test(lower)) {
+    return "Player safety / bullying concern";
+  }
+  if (/\bharassment\b/.test(lower)) return "Harassment concern";
+  if (/\babuse\b/.test(lower)) return "Possible abuse or safeguarding concern";
+  if (/\bthreat|threatened\b/.test(lower)) return "Threat or safety concern";
+  if (/\bmisconduct\b/.test(lower)) return "Misconduct concern";
+  if (/\breport\b/.test(lower)) return "Report that needs the right process";
+
+  const sentence = firstPlainSentence(latestText || combinedText);
+  return sentence || "Responsibility or safety concern";
+}
+
+function inferResponsibilityRole(text: string) {
+  const lower = text.toLowerCase();
+  if (/\bleague president\b/.test(lower)) return "League volunteer or coach trying to handle a concern responsibly";
+  if (/\bcoach|coaching|practice|game|player|team\b/.test(lower)) return "Coach or team adult responsible for player safety";
+  if (/\bparent|guardian|my kid|my child\b/.test(lower)) return "Parent or guardian trying to protect a child";
+  if (/\bteacher|student|school|principal\b/.test(lower)) return "School adult responsible for student wellbeing";
+  if (/\bemployee|manager|hr|workplace|supervisor\b/.test(lower)) return "Workplace adult responsible for a safe process";
+  return "Responsible person in the situation";
+}
+
+function inferResponsibilityConcern(text: string) {
+  const lower = text.toLowerCase();
+  if (/\bbully|bullying\b/.test(lower)) return "A bullying report needs to be documented and handled through the right league process.";
+  if (/\bharassment\b/.test(lower)) return "A harassment concern needs documentation, policy review, and appropriate escalation.";
+  if (/\babuse|threat|immediate danger|ongoing danger\b/.test(lower)) {
+    return "The concern may involve serious or ongoing risk, so it should not be handled alone.";
+  }
+  if (/\bunsafe|safety|harm|hurt\b/.test(lower)) return "Someone's safety or wellbeing may need a temporary protective step.";
+  return "Make sure the concern is handled through the right process, with documentation and appropriate escalation.";
+}
+
+function inferResponsibilityPeople(text: string) {
+  const lower = text.toLowerCase();
+  const people: string[] = [];
+
+  if (/\bleague president|president\b/.test(lower)) people.push("League president");
+  if (/\bdirector\b/.test(lower)) people.push("Program director");
+  if (/\bprincipal|school\b/.test(lower)) people.push("School administrator");
+  if (/\bhr|workplace|employee\b/.test(lower)) people.push("HR or workplace lead");
+  if (/\bparent|guardian\b/.test(lower)) people.push("Reporting parent or guardian");
+  if (/\bcoach\b/.test(lower)) people.push("Coach involved");
+
+  if (people.length === 0) {
+    people.push("Appropriate organization leader", "Person who reported the concern");
+  }
+
+  if (/\babuse|threat|immediate danger|ongoing danger|serious harm\b/.test(lower)) {
+    people.push("Safeguarding lead or appropriate authority if risk is immediate or severe");
+  }
+
+  return uniqueStrings(people);
+}
+
+function inferResponsibilityPolicies(text: string) {
+  const lower = text.toLowerCase();
+  const policies: string[] = [];
+
+  if (/\bleague|player|coach|team|practice|game|baseball|tee ball\b/.test(lower)) {
+    policies.push("League conduct and safety policy");
+  }
+  if (/\bschool|student|teacher\b/.test(lower)) policies.push("School safeguarding or student conduct policy");
+  if (/\bworkplace|employee|hr|manager\b/.test(lower)) policies.push("Workplace conduct and reporting policy");
+  if (/\bharassment|abuse|misconduct|bully|bullying|threat\b/.test(lower)) {
+    policies.push("Reporting and escalation procedure");
+  }
+
+  return uniqueStrings(policies.length > 0 ? policies : ["Organization conduct and safety policy"]);
+}
+
+function inferResponsibilityMessages(text: string, peopleToContact: string[]) {
+  const lower = text.toLowerCase();
+  const messages: string[] = [];
+
+  if (peopleToContact.some((person) => person.toLowerCase().includes("president"))) {
+    messages.push("Message to the league president");
+  }
+  if (peopleToContact.some((person) => person.toLowerCase().includes("parent") || person.toLowerCase().includes("guardian"))) {
+    messages.push("Follow-up to the parent or guardian with process and timing");
+  }
+  if (/\bcoach\b/.test(lower)) messages.push("Conversation notes or message for the coach");
+  if (messages.length === 0) messages.push("Message to the appropriate organization leader");
+
+  return uniqueStrings(messages);
+}
+
+function inferResponsibilityNextSteps(text: string, peopleToContact: string[], policiesToCheck: string[]) {
+  const lower = text.toLowerCase();
+  const leader = peopleToContact[0] ?? "the appropriate organization leader";
+  const policy = policiesToCheck[0] ?? "the relevant conduct or safety policy";
+  const steps = [
+    "Write down exactly what was reported, who reported it, dates, and any immediate safety concern.",
+    `Check ${policy}.`,
+    `Loop in ${leader} before deciding consequences alone.`,
+    "Decide whether a temporary safety step is needed before the next practice, game, meeting, or interaction.",
+    "Use the policy/process as the anchor before talking with the person involved.",
+    "Follow up with the reporting person with the process and timeline."
+  ];
+
+  if (/\babuse|threat|immediate danger|ongoing danger|serious harm\b/.test(lower)) {
+    steps.splice(3, 0, "If there is immediate or severe risk, involve the appropriate safeguarding lead, organization leadership, or authorities.");
+  }
+
+  return steps;
+}
+
+function firstPlainSentence(text: string) {
+  return (
+    text
+      .trim()
+      .replace(/\s+/g, " ")
+      .split(/[.!?]/)[0]
+      ?.trim()
+      .slice(0, 140) ?? ""
   );
 }
 
@@ -3007,6 +3262,24 @@ function routeUserNeed(route: ConversationRoute) {
   };
 
   return needs[route];
+}
+
+function responsibilityPlanMemory(plan: ResponsibilityPlan) {
+  const lines = [
+    "Responsibility Plan in progress.",
+    `Issue: ${plan.issue}`,
+    `Your role: ${plan.role}`,
+    `Immediate concern: ${plan.immediateConcern}`,
+    plan.nextSteps.length > 0 ? `Next steps: ${plan.nextSteps.join(" | ")}` : "",
+    plan.peopleToContact.length > 0 ? `People to contact: ${plan.peopleToContact.join(", ")}` : "",
+    plan.policiesToCheck.length > 0 ? `Policy to check: ${plan.policiesToCheck.join(", ")}` : "",
+    plan.communicationsToDraft.length > 0 ? `Messages to draft: ${plan.communicationsToDraft.join(", ")}` : "",
+    `Status: ${plan.status}`,
+    "In responsibility/safety mode, prioritize concrete responsible action over reflective questions.",
+    "If the user asks what to do or asks for advice, give a bounded action sequence first, then offer help drafting a message, turning it into a checklist, or saving the plan."
+  ];
+
+  return lines.filter(Boolean).join("\n");
 }
 
 function decisionFrameUpdateMemory(update: DecisionFrameUpdate) {
@@ -3077,6 +3350,15 @@ function activeDecisionFrameForSession(frames: DecisionFrame[], session: Current
   }
 
   return frames.find((frame) => frame.sourceSessionId === session.sessionId && frame.status === "open") ?? null;
+}
+
+function activeResponsibilityPlanForSession(plans: ResponsibilityPlan[], session: CurrentSession | null) {
+  if (!session) return null;
+  if (session.activeResponsibilityPlanId) {
+    return plans.find((plan) => plan.id === session.activeResponsibilityPlanId && plan.status !== "resolved") ?? null;
+  }
+
+  return plans.find((plan) => plan.sourceSessionId === session.sessionId && plan.status !== "resolved") ?? null;
 }
 
 function latestSubstantiveUserText(session: CurrentSession) {
@@ -3438,6 +3720,64 @@ function isDecisionFrame(value: unknown): value is DecisionFrame {
   );
 }
 
+function isResponsibilityPlanStatus(value: unknown): value is ResponsibilityPlanStatus {
+  return value === "open" || value === "monitoring" || value === "resolved";
+}
+
+function isResponsibilityPlan(value: unknown): value is ResponsibilityPlan {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string" &&
+    (value.sourceSessionId === null || typeof value.sourceSessionId === "string") &&
+    typeof value.issue === "string" &&
+    typeof value.role === "string" &&
+    typeof value.immediateConcern === "string" &&
+    Array.isArray(value.nextSteps) &&
+    value.nextSteps.every((item) => typeof item === "string") &&
+    Array.isArray(value.peopleToContact) &&
+    value.peopleToContact.every((item) => typeof item === "string") &&
+    Array.isArray(value.policiesToCheck) &&
+    value.policiesToCheck.every((item) => typeof item === "string") &&
+    Array.isArray(value.communicationsToDraft) &&
+    value.communicationsToDraft.every((item) => typeof item === "string") &&
+    isResponsibilityPlanStatus(value.status)
+  );
+}
+
+function normalizeResponsibilityPlan(value: unknown): ResponsibilityPlan | null {
+  if (!isRecord(value)) return null;
+
+  if (isResponsibilityPlan(value)) {
+    return value;
+  }
+
+  if (typeof value.id !== "string" || typeof value.createdAt !== "string") {
+    return null;
+  }
+
+  const issue = typeof value.issue === "string" && value.issue.trim() ? value.issue : "Responsibility or safety concern";
+
+  return {
+    id: value.id,
+    createdAt: value.createdAt,
+    updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : value.createdAt,
+    sourceSessionId: typeof value.sourceSessionId === "string" ? value.sourceSessionId : null,
+    issue,
+    role: typeof value.role === "string" && value.role.trim() ? value.role : "Responsible person in the situation",
+    immediateConcern:
+      typeof value.immediateConcern === "string" && value.immediateConcern.trim()
+        ? value.immediateConcern
+        : "Make sure the concern is handled through the right process.",
+    nextSteps: cleanStringList(value.nextSteps),
+    peopleToContact: cleanStringList(value.peopleToContact),
+    policiesToCheck: cleanStringList(value.policiesToCheck),
+    communicationsToDraft: cleanStringList(value.communicationsToDraft),
+    status: isResponsibilityPlanStatus(value.status) ? value.status : "open"
+  };
+}
+
 function normalizeDecisionFrame(value: unknown): DecisionFrame | null {
   if (!isRecord(value)) return null;
 
@@ -3565,6 +3905,10 @@ function normalizeSession(session: CurrentSession): CurrentSession {
       typeof (session as CurrentSession & { activeDecisionFrameId?: unknown }).activeDecisionFrameId === "string"
         ? (session as CurrentSession & { activeDecisionFrameId: string }).activeDecisionFrameId
         : null,
+    activeResponsibilityPlanId:
+      typeof (session as CurrentSession & { activeResponsibilityPlanId?: unknown }).activeResponsibilityPlanId === "string"
+        ? (session as CurrentSession & { activeResponsibilityPlanId: string }).activeResponsibilityPlanId
+        : null,
     awaitingRouteChoice:
       typeof (session as CurrentSession & { awaitingRouteChoice?: unknown }).awaitingRouteChoice === "boolean"
         ? (session as CurrentSession & { awaitingRouteChoice: boolean }).awaitingRouteChoice
@@ -3666,6 +4010,23 @@ function readDecisionFramesFromStorage(): DecisionFrame[] {
   return [];
 }
 
+function readResponsibilityPlansFromStorage(): ResponsibilityPlan[] {
+  const storedPlans = window.localStorage.getItem(STORAGE_KEYS.responsibilityPlans);
+  const parsedPlans = parseStoredJson<unknown>(storedPlans);
+
+  if (Array.isArray(parsedPlans)) {
+    return parsedPlans
+      .map(normalizeResponsibilityPlan)
+      .filter((plan): plan is ResponsibilityPlan => plan !== null);
+  }
+
+  if (storedPlans) {
+    window.localStorage.removeItem(STORAGE_KEYS.responsibilityPlans);
+  }
+
+  return [];
+}
+
 function clearPrototypeStorage() {
   Object.values(STORAGE_KEYS).forEach((key) => window.localStorage.removeItem(key));
 
@@ -3691,6 +4052,7 @@ function legacyEntriesToSessions(entries: LegacyEntry[]): CompletedSession[] {
     touchpointType: "daily_check_in",
     conversationRoute: "meaning_moment",
     activeDecisionFrameId: null,
+    activeResponsibilityPlanId: null,
     awaitingRouteChoice: false,
     tags: entry.tags,
     summary: entry.response,
@@ -3723,6 +4085,7 @@ export default function Home() {
   const [sessions, setSessions] = useState<CompletedSession[]>([]);
   const [meaningNotes, setMeaningNotes] = useState<MeaningNote[]>([]);
   const [decisionFrames, setDecisionFrames] = useState<DecisionFrame[]>([]);
+  const [responsibilityPlans, setResponsibilityPlans] = useState<ResponsibilityPlan[]>([]);
   const [pendingMeaningNote, setPendingMeaningNote] = useState<MeaningNote | null>(null);
   const [meaningNoteDraftText, setMeaningNoteDraftText] = useState("");
   const [meaningNoteMode, setMeaningNoteMode] = useState<MeaningNoteMode>("review");
@@ -3745,6 +4108,7 @@ export default function Home() {
     const parsedSession = readCurrentSessionFromStorage();
     const parsedMeaningNotes = readMeaningNotesFromStorage();
     const parsedDecisionFrames = readDecisionFramesFromStorage();
+    const parsedResponsibilityPlans = readResponsibilityPlansFromStorage();
 
     if (parsedProfile) {
       setProfile(parsedProfile);
@@ -3755,6 +4119,7 @@ export default function Home() {
     setSessions(parsedSessions);
     setMeaningNotes(parsedMeaningNotes);
     setDecisionFrames(parsedDecisionFrames);
+    setResponsibilityPlans(parsedResponsibilityPlans);
 
     if (parsedSession) {
       if (parsedSession.status === "active" && isToday(parsedSession.startedAt)) {
@@ -3786,6 +4151,12 @@ export default function Home() {
       window.localStorage.setItem(STORAGE_KEYS.decisionFrames, JSON.stringify(decisionFrames));
     }
   }, [decisionFrames, ready]);
+
+  useEffect(() => {
+    if (ready) {
+      window.localStorage.setItem(STORAGE_KEYS.responsibilityPlans, JSON.stringify(responsibilityPlans));
+    }
+  }, [responsibilityPlans, ready]);
 
   useEffect(() => {
     if (!ready) return;
@@ -3900,7 +4271,7 @@ export default function Home() {
             ...currentSession.messages,
             makeUserMessage(trimmed),
             makeClaraMessage({
-              text: "Okay. Let's make this practical. What feels like the first responsible next step?",
+              text: "Okay. Give me the situation in one paragraph, and I'll help make the next step concrete.",
               expectedInput: "text"
             })
           ]
@@ -4065,6 +4436,7 @@ export default function Home() {
       messages: [...currentSession.messages, userMessage]
     };
     const existingDecisionFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
+    const existingResponsibilityPlan = activeResponsibilityPlanForSession(responsibilityPlans, currentSession);
     const routeClassification = await classifyRoute(trimmed, sessionWithReply, profile, sessions, existingDecisionFrame);
     const routedAs = routeClassification.route;
     console.log("Clara route classification", routeClassification);
@@ -4091,10 +4463,12 @@ export default function Home() {
       routedAs === "decision_frame" && !existingDecisionFrame ? decisionFrameFromText(trimmed, sessionWithReply) : null;
     let decisionFrame = newDecisionFrame ?? existingDecisionFrame;
     let decisionFrameUpdate: DecisionFrameUpdate | null = null;
+    let responsibilityPlan: ResponsibilityPlan | null = null;
     let routedSession: CurrentSession = {
       ...sessionWithReply,
       conversationRoute: routedAs,
       activeDecisionFrameId: decisionFrame?.id ?? sessionWithReply.activeDecisionFrameId,
+      activeResponsibilityPlanId: sessionWithReply.activeResponsibilityPlanId,
       awaitingRouteChoice: false
     };
 
@@ -4121,6 +4495,22 @@ export default function Home() {
       };
     }
 
+    if (routedAs === "responsibility_safety") {
+      const inferredPlan = responsibilityPlanFromText(trimmed, sessionWithReply);
+      const updatedPlan = existingResponsibilityPlan ? mergeResponsibilityPlan(existingResponsibilityPlan, inferredPlan) : inferredPlan;
+      responsibilityPlan = updatedPlan;
+      console.log("Responsibility Plan updated", updatedPlan);
+      setResponsibilityPlans((current) =>
+        current.some((plan) => plan.id === updatedPlan.id)
+          ? current.map((plan) => (plan.id === updatedPlan.id ? updatedPlan : plan))
+          : [updatedPlan, ...current]
+      );
+      routedSession = {
+        ...routedSession,
+        activeResponsibilityPlanId: updatedPlan.id
+      };
+    }
+
     if (shouldCloseForDepth(routedSession, trimmed)) {
       await closeSession(trimmed, "That's a good place to leave it for today.");
       return;
@@ -4139,6 +4529,7 @@ export default function Home() {
         userIntent: detectedUserIntent,
         decisionFrame,
         decisionFrameUpdate,
+        responsibilityPlan,
         routeClassification
       });
       setCurrentSession(
@@ -4165,6 +4556,7 @@ export default function Home() {
         userIntent: detectedUserIntent,
         decisionFrame,
         decisionFrameUpdate,
+        responsibilityPlan,
         routeClassification
       });
       setCurrentSession(
@@ -4191,6 +4583,7 @@ export default function Home() {
       userIntent: detectedUserIntent,
       decisionFrame,
       decisionFrameUpdate,
+      responsibilityPlan,
       routeClassification
     });
     setCurrentSession(
@@ -4393,9 +4786,14 @@ export default function Home() {
     if (!currentSession) return;
 
     const activeFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
+    const activeResponsibilityPlan = activeResponsibilityPlanForSession(responsibilityPlans, currentSession);
     const isDecisionSession = isDecisionRoute(currentSession.conversationRoute) || activeFrame !== null;
+    const isResponsibilitySession = currentSession.conversationRoute === "responsibility_safety" || activeResponsibilityPlan !== null;
     const finalClaraText =
-      claraText ?? (isDecisionSession ? "Saved. You can come back to this from Frames." : "That's a good place to leave it for today.");
+      claraText ??
+      (isDecisionSession || isResponsibilitySession
+        ? "Saved. You can come back to this from Frames."
+        : "That's a good place to leave it for today.");
     const now = new Date().toISOString();
     const messages = choiceText
       ? [
@@ -4436,6 +4834,23 @@ export default function Home() {
         };
         const updatedFrame = updateDecisionFrameSourceSummary(pausedFrame, closedSession, choiceText ?? "");
         setDecisionFrames((current) => current.map((frame) => (frame.id === updatedFrame.id ? updatedFrame : frame)));
+      }
+      return;
+    }
+
+    if (isResponsibilitySession) {
+      if (activeResponsibilityPlan) {
+        setResponsibilityPlans((current) =>
+          current.map((plan) =>
+            plan.id === activeResponsibilityPlan.id
+              ? {
+                  ...plan,
+                  status: plan.status === "resolved" ? "resolved" : "monitoring",
+                  updatedAt: now
+                }
+              : plan
+          )
+        );
       }
       return;
     }
@@ -4737,6 +5152,7 @@ export default function Home() {
   const currentSessionLabel = currentSession ? sessionDisplayLabel(currentSession) : "Daily check-in";
   const currentSessionIsTouchpoint = currentSession?.touchpointType && currentSession.touchpointType !== "daily_check_in";
   const activeDecisionFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
+  const activeResponsibilityPlan = activeResponsibilityPlanForSession(responsibilityPlans, currentSession);
   const selectedDecisionFrame =
     selectedDecisionFrameId ? decisionFrames.find((frame) => frame.id === selectedDecisionFrameId) ?? null : null;
 
@@ -4809,6 +5225,7 @@ export default function Home() {
           {currentSession ? (
             <>
               {activeDecisionFrame ? <FrameSoFarCard frame={activeDecisionFrame} /> : null}
+              {!activeDecisionFrame && activeResponsibilityPlan ? <ResponsibilityPlanSoFarCard plan={activeResponsibilityPlan} /> : null}
 
               <section className="space-y-4">
                 {currentSession.messages.map((message, index) => (
@@ -5036,19 +5453,36 @@ export default function Home() {
                 Clara won't decide for you. She helps organize what matters, what's uncertain, and what the next honest
                 step might be.
               </p>
-              {decisionFrames.length === 0 ? (
-                <EmptyState text="Frames will appear here when a check-in turns into a question to think through." />
-              ) : (
-                decisionFrames.map((frame) => (
-                  <DecisionFrameCard
-                    frame={frame}
-                    key={frame.id}
-                    onOpen={(id) => setSelectedDecisionFrameId(id)}
-                    onToggleStatus={toggleDecisionFrameStatus}
-                    onUpdate={updateDecisionFrame}
-                  />
-                ))
-              )}
+              {decisionFrames.length === 0 && responsibilityPlans.length === 0 ? (
+                <EmptyState text="Frames and responsibility plans will appear here when a check-in turns into something to organize." />
+              ) : null}
+              {decisionFrames.length > 0 ? (
+                <section className="space-y-4">
+                  <p className="text-sm uppercase tracking-[0.18em] text-clay">Decision Frames</p>
+                  {decisionFrames.map((frame) => (
+                    <DecisionFrameCard
+                      frame={frame}
+                      key={frame.id}
+                      onOpen={(id) => setSelectedDecisionFrameId(id)}
+                      onToggleStatus={toggleDecisionFrameStatus}
+                      onUpdate={updateDecisionFrame}
+                    />
+                  ))}
+                </section>
+              ) : null}
+              {responsibilityPlans.length > 0 ? (
+                <section className="space-y-4 border-t border-pearl/10 pt-5">
+                  <div className="space-y-2">
+                    <p className="text-sm uppercase tracking-[0.18em] text-clay">Responsibility Plans</p>
+                    <p className="text-base leading-6 text-fog">
+                      For safety, duty-of-care, or misconduct concerns where the next step needs a careful process.
+                    </p>
+                  </div>
+                  {responsibilityPlans.map((plan) => (
+                    <ResponsibilityPlanCard plan={plan} key={plan.id} />
+                  ))}
+                </section>
+              ) : null}
             </>
           )}
         </section>
@@ -5375,6 +5809,31 @@ function FrameSoFarCard({ frame }: { frame: DecisionFrame }) {
           <p className="text-sm text-clay">Next honest step</p>
           <p className="text-base leading-6 text-fog">{frame.nextStep || "Not clear yet."}</p>
         </div>
+      </div>
+    </details>
+  );
+}
+
+function ResponsibilityPlanSoFarCard({ plan }: { plan: ResponsibilityPlan }) {
+  return (
+    <details className="rounded-md border border-pearl/10 bg-pearl/7 p-4" open>
+      <summary className="cursor-pointer text-sm uppercase tracking-[0.18em] text-clay">Plan so far</summary>
+      <div className="mt-4 space-y-3">
+        <p className="text-sm leading-6 text-fog">
+          Clara is helping keep the next steps concrete: document, check policy, loop in the right people, and avoid
+          handling serious safety concerns alone.
+        </p>
+        <div className="space-y-1">
+          <p className="text-sm text-clay">Issue</p>
+          <p className="text-base leading-6 text-pearl">{plan.issue || "Not clear yet."}</p>
+        </div>
+        <div className="space-y-1">
+          <p className="text-sm text-clay">Immediate concern</p>
+          <p className="text-base leading-6 text-fog">{plan.immediateConcern || "Not clear yet."}</p>
+        </div>
+        <CompactFrameSection label="Next steps" values={plan.nextSteps} />
+        <CompactFrameSection label="People to contact" values={plan.peopleToContact} />
+        <CompactFrameSection label="Policy to check" values={plan.policiesToCheck} />
       </div>
     </details>
   );
@@ -5782,6 +6241,55 @@ function DecisionFrameCard({
         </>
       )}
     </article>
+  );
+}
+
+function ResponsibilityPlanCard({ plan }: { plan: ResponsibilityPlan }) {
+  return (
+    <article className="space-y-4 border-t border-pearl/10 pt-5">
+      <div className="flex items-center justify-between gap-4 text-sm text-fog">
+        <span>{formatDate(plan.createdAt)}</span>
+        <span>{plan.status}</span>
+      </div>
+      <p className="text-sm uppercase tracking-[0.18em] text-clay">Responsibility Plan</p>
+      <div className="space-y-1">
+        <p className="text-sm text-clay">Issue</p>
+        <p className="text-xl leading-8 text-pearl">{plan.issue || "Not clear yet."}</p>
+      </div>
+      <ResponsibilityPlanText label="Your role" value={plan.role} />
+      <ResponsibilityPlanText label="Immediate concern" value={plan.immediateConcern} />
+      <ResponsibilityPlanList label="Next steps" values={plan.nextSteps} />
+      <ResponsibilityPlanList label="People to contact" values={plan.peopleToContact} />
+      <ResponsibilityPlanList label="Policy to check" values={plan.policiesToCheck} />
+      <ResponsibilityPlanList label="Messages to draft" values={plan.communicationsToDraft} />
+      <ResponsibilityPlanText label="Status" value={plan.status} />
+    </article>
+  );
+}
+
+function ResponsibilityPlanText({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="space-y-1">
+      <p className="text-sm text-clay">{label}</p>
+      <p className="text-lg leading-7 text-fog">{value || "Not clear yet."}</p>
+    </div>
+  );
+}
+
+function ResponsibilityPlanList({ label, values }: { label: string; values: string[] }) {
+  return (
+    <div className="space-y-2">
+      <p className="text-sm text-clay">{label}</p>
+      {values.length === 0 ? (
+        <p className="text-lg leading-7 text-fog">Not clear yet.</p>
+      ) : (
+        <ul className="space-y-2 text-lg leading-7 text-fog">
+          {values.map((value) => (
+            <li key={value}>{value}</li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 

@@ -228,7 +228,15 @@ type UserIntent =
   | "save"
   | "ambiguous_response";
 
-type ResponseMove = "reflect_only" | "gentle_question" | "witness" | "save" | "close" | "continue" | "frame_decision";
+type ResponseMove =
+  | "reflect_only"
+  | "gentle_question"
+  | "witness"
+  | "save"
+  | "close"
+  | "continue"
+  | "frame_decision"
+  | "action_plan";
 
 type ResponseGuidance = {
   suggestedMove: ResponseMove;
@@ -260,9 +268,14 @@ function buildResponseGuidance(
     memory.toLowerCase().includes("decision frame v1");
   const decisionMode = decisionFrame?.currentDecisionMode;
   const continueRequested = userIntent === "explicit_continue" || isContinueSignal(latestUserText);
+  const responsibilityActionRequested =
+    route === "responsibility_safety" &&
+    (isResponsibilityActionRequest(latestUserText) ||
+      routeClassification?.suggestedMode === "action_plan" ||
+      memory.toLowerCase().includes("responsibility plan in progress"));
   const recentQuestionLedReplies = countRecentQuestionLedClaraReplies(transcript);
   const instructions: string[] = [
-    "Use one of these response moves: reflect_only, gentle_question, witness, save, close, continue, frame_decision.",
+    "Use one of these response moves: reflect_only, gentle_question, witness, save, close, continue, frame_decision, action_plan.",
     "Do not ask more than two question-led Clara responses in a row.",
     "A response may have no question.",
     `Detected userIntent: ${userIntent}. Use it as conversational pragmatics, not user-facing text.`
@@ -287,12 +300,19 @@ function buildResponseGuidance(
       "Do not rush to save or close."
     );
   } else if (route === "responsibility_safety") {
-    suggestedMove = "gentle_question";
+    suggestedMove = responsibilityActionRequested ? "action_plan" : "gentle_question";
     instructions.push(
       "High-level route: responsibility_safety.",
       "The user likely needs to act responsibly around safety, duty-of-care, misconduct, bullying, harassment, or wellbeing.",
-      "Be calm and concrete. Prioritize immediate safety, documentation, appropriate escalation, and not handling serious issues alone.",
-      "Do not turn this into a meaning reflection."
+      "Be calm and concrete. Prioritize immediate safety, documentation, policy review, appropriate escalation, and not handling serious issues alone.",
+      "Do not turn this into a meaning reflection.",
+      "Ask at most one clarifying question before giving a next-step plan unless truly critical facts are missing.",
+      responsibilityActionRequested
+        ? "Use action-plan mode now: do not ask another reflective question first. Give a short concrete sequence, then stop with one practical offer such as drafting the message, making a checklist, or saving the plan."
+        : "If there is enough context to act responsibly, move to a short next-step sequence instead of another subjective question.",
+      "Good offers after the plan: 'Want help drafting the message?', 'Want to turn this into a checklist?', or 'Want to save this as the plan?'",
+      "Avoid questions like 'What feels heaviest?', 'What are you hoping for?', 'Would that put you in a tough spot?', or 'Are you hoping for guidance?'",
+      "Include concise boundaries when relevant: follow the organization policy, do not investigate alone if serious harm/threats/abuse/ongoing danger are involved, involve appropriate leadership/safeguarding/authorities if risk is immediate or severe, and Clara is not a lawyer or investigator."
     );
   } else if (route === "orientation") {
     suggestedMove = "gentle_question";
@@ -529,6 +549,23 @@ function asksForResearchHelp(text: string) {
     /\bi don'?t know enough\b/.test(lower) ||
     /\bwe need more information\b/.test(lower) ||
     /\bwhat facts do we need\b/.test(lower)
+  );
+}
+
+function isResponsibilityActionRequest(text: string) {
+  const lower = text.toLowerCase();
+
+  return (
+    /\bwhat should (i|we) do\b/.test(lower) ||
+    /\bwhat should (i|we) do first\b/.test(lower) ||
+    /\bwhat do (i|we) do (first|next|now)\b/.test(lower) ||
+    /\bi just want to know what (i|we) should do next\b/.test(lower) ||
+    /\bdo you have advice\b/.test(lower) ||
+    /\bany advice\b/.test(lower) ||
+    /\bi need (advice|guidance|to handle this|to deal with this)\b/.test(lower) ||
+    /\bi need to (talk to|contact|call|email|message|loop in)\b.*\b(president|director|principal|coach|parent|guardian|hr|admin|leader|supervisor)\b/.test(
+      lower
+    )
   );
 }
 
