@@ -55,7 +55,7 @@ Routes:
 - decision_frame: messy choices, tradeoffs, should I/we, how should I think about this, moving/job/school/goals decisions. User need: frame the question. Artifact: decision_frame.
 - responsibility_safety: safety, bullying, harassment, duty-of-care, misconduct, child/player/student/employee wellbeing, immediate action responsibility. User need: act responsibly. Artifact: responsibility_plan.
 - orientation: preparing for something: meeting, practice, hard conversation, day, transition. User need: orient before entering. Artifact: orientation_note.
-- quest_goal: aspirations, goals, habits, becoming, growth challenges. User need: turn meaning into practice. Artifact: quest or goal_thread.
+- quest_goal: aspirations, goals, habits, becoming, small intentional practices, growth challenges. User need: turn meaning into practice. Artifact: quest.
 - support_witness: grief, illness, overwhelm, sadness, bad news, emotional heaviness. User need: be met with presence, not pushed into solving. Artifact: usually null.
 - unclear: ambiguous. Clara should ask a routing question.
 
@@ -67,6 +67,7 @@ Rules:
 - If there is a messy choice or tradeoff about what to do, prefer decision_frame.
 - If the user is preparing to enter a situation, prefer orientation.
 - If the user is trying to build a practice, habit, or longer growth path, prefer quest_goal.
+- If the user says "I want to...", "I'm trying to...", "I want to become...", "I need to get better at...", or wants to be more present/write more/be healthier/be a better leader/parent/creator, prefer quest_goal unless it is clearly a decision or safety issue.
 `.trim();
 
 export async function POST(request: Request) {
@@ -184,7 +185,17 @@ function fallbackRoute(text: string): RouteClassification {
     return { route: "orientation", confidence: 0.58, reason: "Preparation or orientation language.", ...routeMetadata("orientation") };
   }
 
-  if (/\b(goal|habit|aspiration|becoming|practice|growth challenge)\b/.test(lower)) {
+  if (
+    /\b(goal|habit|aspiration|becoming|practice|growth challenge)\b/.test(lower) ||
+    /\bi want to (be|become|write|create|make|practice|build|get better|be more|show up|lead|parent|exercise|eat|sleep|move)\b/.test(
+      lower
+    ) ||
+    /\bi'?m trying to (be|become|write|create|make|practice|build|get better|be more|show up|lead|parent|exercise|eat|sleep|move)\b/.test(
+      lower
+    ) ||
+    /\bi need to get better at\b/.test(lower) ||
+    /\b(be more present|write more|be healthier|better leader|better parent|better creator)\b/.test(lower)
+  ) {
     return { route: "quest_goal", confidence: 0.58, reason: "Goal or practice language.", ...routeMetadata("quest_goal") };
   }
 
@@ -218,7 +229,7 @@ function routeMetadata(route: ClaraRoute, actionPlan = false): Pick<RouteClassif
     decision_frame: { suggestedArtifactType: "decision_frame", suggestedMode: "frame_decision" },
     responsibility_safety: { suggestedArtifactType: "responsibility_plan", suggestedMode: actionPlan ? "action_plan" : "responsible_action" },
     orientation: { suggestedArtifactType: "orientation_note", suggestedMode: "orient_before_entering" },
-    quest_goal: { suggestedArtifactType: "goal_thread", suggestedMode: "turn_into_practice" },
+    quest_goal: { suggestedArtifactType: "quest", suggestedMode: "turn_into_practice" },
     support_witness: { suggestedArtifactType: null, suggestedMode: "witness" },
     unclear: { suggestedArtifactType: null, suggestedMode: "clarify_route" }
   };

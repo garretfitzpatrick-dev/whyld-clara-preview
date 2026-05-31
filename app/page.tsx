@@ -60,6 +60,8 @@ type DecisionFrameStage = "opening" | "mapping" | "clarifying" | "next_step" | "
 type DecisionMode = "reflect" | "map" | "research" | "compare" | "act";
 type ResearchTaskStatus = "open" | "done";
 type ResponsibilityPlanStatus = "open" | "monitoring" | "resolved";
+type QuestCadence = "once" | "daily" | "weekly" | "custom";
+type QuestStatus = "active" | "paused" | "completed";
 type ResponseStrategy =
   | "acknowledge"
   | "reflect"
@@ -123,6 +125,7 @@ type CurrentSession = {
   conversationRoute: ConversationRoute;
   activeDecisionFrameId: string | null;
   activeResponsibilityPlanId: string | null;
+  activeQuestId: string | null;
   awaitingRouteChoice: boolean;
 };
 
@@ -211,6 +214,23 @@ type ResponsibilityPlan = {
   status: ResponsibilityPlanStatus;
 };
 
+type Quest = {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  sourceSessionId: string | null;
+  title: string;
+  direction: string;
+  whyItMatters: string;
+  practice: string;
+  cadence: QuestCadence;
+  checkInPrompt: string;
+  obstacles: string[];
+  evidence: string[];
+  nextStep: string | null;
+  status: QuestStatus;
+};
+
 type LegacyEntry = {
   id: string;
   createdAt: string;
@@ -265,6 +285,7 @@ type UserIntentContext = {
   decisionFrame?: DecisionFrame | null;
   decisionFrameUpdate?: DecisionFrameUpdate | null;
   responsibilityPlan?: ResponsibilityPlan | null;
+  quest?: Quest | null;
   routeClassification?: RouteClassification | null;
 };
 
@@ -318,7 +339,8 @@ const STORAGE_KEYS = {
   legacyEntries: "whyld-world-clara-entries",
   meaningNotes: "whyld-world-clara-meaning-notes",
   decisionFrames: "whyld-world-clara-decision-frames",
-  responsibilityPlans: "whyld-world-clara-responsibility-plans"
+  responsibilityPlans: "whyld-world-clara-responsibility-plans",
+  quests: "whyld-world-clara-quests"
 };
 
 const APP_STORAGE_PREFIXES = ["whyld-world-", "whyld-", "clara-"];
@@ -604,6 +626,7 @@ function createSession(
     conversationRoute: "meaning_moment",
     activeDecisionFrameId: null,
     activeResponsibilityPlanId: null,
+    activeQuestId: null,
     awaitingRouteChoice: false
   };
 }
@@ -1133,6 +1156,7 @@ function isStoppingSignal(text: string) {
 function shouldCloseForDepth(session: CurrentSession, latestReply: string) {
   if (isDecisionRoute(session.conversationRoute) || session.activeDecisionFrameId) return false;
   if (session.conversationRoute === "responsibility_safety" || session.activeResponsibilityPlanId) return false;
+  if (session.conversationRoute === "quest_goal" || session.activeQuestId) return false;
   if (isContinueSignal(latestReply)) return false;
   if (isStoppingSignal(latestReply)) return true;
   return false;
@@ -1215,6 +1239,10 @@ function finalizeGeneratedSession(session: CurrentSession, frame: DecisionFrame 
   }
 
   if (session.conversationRoute === "responsibility_safety" || session.activeResponsibilityPlanId) {
+    return session;
+  }
+
+  if (session.conversationRoute === "quest_goal" || session.activeQuestId) {
     return session;
   }
 
@@ -1386,6 +1414,7 @@ function emptyIntentSession(): CurrentSession {
     conversationRoute: "meaning_moment",
     activeDecisionFrameId: null,
     activeResponsibilityPlanId: null,
+    activeQuestId: null,
     awaitingRouteChoice: false
   };
 }
@@ -1671,7 +1700,8 @@ async function generateClaraFromConversation(
     intentContext?.routeClassification ? routeClassificationMemory(intentContext.routeClassification) : "",
     intentContext?.decisionFrame ? decisionFrameMemory(intentContext.decisionFrame) : "",
     intentContext?.decisionFrameUpdate ? decisionFrameUpdateMemory(intentContext.decisionFrameUpdate) : "",
-    intentContext?.responsibilityPlan ? responsibilityPlanMemory(intentContext.responsibilityPlan) : ""
+    intentContext?.responsibilityPlan ? responsibilityPlanMemory(intentContext.responsibilityPlan) : "",
+    intentContext?.quest ? questMemory(intentContext.quest) : ""
   ]
     .filter(Boolean)
     .join("\n");
@@ -1686,7 +1716,8 @@ async function generateClaraFromConversation(
       routeClassification: intentContext?.routeClassification,
       decisionFrame: intentContext?.decisionFrame,
       decisionFrameUpdate: intentContext?.decisionFrameUpdate,
-      responsibilityPlan: intentContext?.responsibilityPlan
+      responsibilityPlan: intentContext?.responsibilityPlan,
+      quest: intentContext?.quest
     });
     const response = await fetch("/api/clara-lab", {
       method: "POST",
@@ -2869,6 +2900,7 @@ function isLowSignalFrameReply(text: string) {
 function routeConversationMessage(text: string, session: CurrentSession, activeFrame: DecisionFrame | null): ConversationRoute {
   if (isDecisionRoute(session.conversationRoute) || activeFrame) return "decision_frame";
   if (session.conversationRoute === "responsibility_safety") return "responsibility_safety";
+  if (session.conversationRoute === "quest_goal") return "quest_goal";
   if (isSeriousLifeEvent(text)) return "support_witness";
   if (isResponsibilitySafetyMoment(text)) return "responsibility_safety";
   if (isDecisionMoment(text) || hasStrongDecisionContent(text)) return "decision_frame";
@@ -2903,7 +2935,7 @@ function routeMetadata(route: ConversationRoute, confidence: number, reason: str
       suggestedMode: "orient_before_entering"
     },
     quest_goal: {
-      suggestedArtifactType: "goal_thread",
+      suggestedArtifactType: "quest",
       suggestedMode: "turn_into_practice"
     },
     support_witness: {
@@ -2941,6 +2973,10 @@ async function classifyRoute(
       text,
       session
     );
+  }
+
+  if (session.conversationRoute === "quest_goal") {
+    return routeMetadata("quest_goal", 0.95, "A Quest loop is already active.");
   }
 
   try {
@@ -3215,9 +3251,241 @@ function isQuestGoalMoment(text: string) {
   const lower = text.toLowerCase();
 
   return (
-    /\b(goal|goals|habit|habits|aspiration|aspire|becoming|practice|growth challenge|want to become|trying to build)\b/.test(lower) &&
+    /\b(goal|goals|habit|habits|aspiration|aspire|becoming|practice|growth challenge|want to become|trying to build)\b/.test(lower) ||
+    /\bi want to (be|become|write|create|make|practice|build|get better|be more|show up|lead|parent|exercise|eat|sleep|move)\b/.test(
+      lower
+    ) ||
+    /\bi'?m trying to (be|become|write|create|make|practice|build|get better|be more|show up|lead|parent|exercise|eat|sleep|move)\b/.test(
+      lower
+    ) ||
+    /\bi need to get better at\b/.test(lower) ||
+    /\b(be more present|write more|be healthier|better leader|better parent|better creator)\b/.test(lower)
+  ) && (
     !isDecisionMoment(text)
   );
+}
+
+function isQuestOfferMessage(message: ClaraMessage | undefined) {
+  return message?.choices?.includes("Make it a quest") ?? false;
+}
+
+function isQuestConfirmChoice(text: string) {
+  const normalized = normalizeChoice(text);
+  return ["make it a quest", "turn it into a quest", "yes", "yeah", "yep", "sure"].includes(normalized);
+}
+
+function isQuestDeclineChoice(text: string) {
+  return ["not now", "no", "nope", "nah"].includes(normalizeChoice(text));
+}
+
+function isQuestContinueChoice(text: string) {
+  return ["keep talking", "keep going", "continue"].includes(normalizeChoice(text));
+}
+
+function questFromText(text: string, session: CurrentSession): Quest {
+  const direction = inferQuestDirection(text || latestQuestAspirationText(session));
+  const practice = inferQuestPractice(direction);
+  const now = new Date().toISOString();
+
+  return {
+    id: crypto.randomUUID(),
+    createdAt: now,
+    updatedAt: now,
+    sourceSessionId: session.sessionId,
+    title: inferQuestTitle(direction),
+    direction,
+    whyItMatters: inferQuestWhyItMatters(direction),
+    practice: practice.practice,
+    cadence: practice.cadence,
+    checkInPrompt: inferQuestCheckInPrompt(direction),
+    obstacles: inferQuestObstacles(direction),
+    evidence: inferQuestEvidence(direction),
+    nextStep: inferQuestNextStep(direction),
+    status: "active"
+  };
+}
+
+function questCreatedText(quest: Quest) {
+  return `Quest created: ${quest.title}. Try this ${formatQuestCadence(quest.cadence).toLowerCase()}: ${quest.practice}`;
+}
+
+function latestQuestAspirationText(session: CurrentSession) {
+  return (
+    [...session.messages]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "user" &&
+          !isQuestConfirmChoice(message.text) &&
+          !isQuestDeclineChoice(message.text) &&
+          !isQuestContinueChoice(message.text) &&
+          !isAcknowledgement(message.text) &&
+          !isStoppingSignal(message.text)
+      )?.text ?? ""
+  );
+}
+
+function inferQuestDirection(text: string) {
+  const cleaned = text
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/[.!?]+$/g, "");
+  const lower = cleaned.toLowerCase();
+  const direct =
+    lower.match(/\bi want to (.+)$/)?.[1] ??
+    lower.match(/\bi'?m trying to (.+)$/)?.[1] ??
+    lower.match(/\bi need to get better at (.+)$/)?.[1] ??
+    lower.match(/\bi want to become (.+)$/)?.[1] ??
+    "";
+
+  if (direct) return sentenceCaseQuestDirection(direct);
+  if (lower.includes("be more present")) return "Be more present";
+  if (lower.includes("write more")) return "Write more";
+  if (lower.includes("be healthier")) return "Be healthier";
+  if (lower.includes("better leader")) return "Be a better leader";
+  if (lower.includes("better parent")) return "Be a better parent";
+  if (lower.includes("better creator")) return "Be a better creator";
+
+  return cleaned ? sentenceCaseQuestDirection(cleaned) : "Practice something that matters";
+}
+
+function sentenceCaseQuestDirection(text: string) {
+  const trimmed = text.trim().replace(/^to\s+/i, "").replace(/\s+/g, " ");
+  if (!trimmed) return "Practice something that matters";
+  return `${trimmed.charAt(0).toUpperCase()}${trimmed.slice(1)}`;
+}
+
+function inferQuestTitle(direction: string) {
+  const lower = direction.toLowerCase();
+  if (lower.includes("present") && /\b(kids|children|family)\b/.test(lower)) return "Protect the first ten minutes";
+  if (lower.includes("present")) return "Arrive fully";
+  if (lower.includes("write")) return "Open the writing window";
+  if (lower.includes("health") || lower.includes("healthier") || lower.includes("exercise") || lower.includes("move")) {
+    return "Choose the next healthy move";
+  }
+  if (lower.includes("leader")) return "Practice the better question";
+  if (lower.includes("parent")) return "One undistracted moment";
+  if (lower.includes("creator") || lower.includes("create") || lower.includes("make")) return "Make before measuring";
+  return `Practice: ${shortenQuestText(direction, 42)}`;
+}
+
+function inferQuestWhyItMatters(direction: string) {
+  const lower = direction.toLowerCase();
+  if (lower.includes("present") && /\b(kids|children|family)\b/.test(lower)) {
+    return "You want time with your kids to feel more connected, especially in the small transitions.";
+  }
+  if (lower.includes("present")) return "You want to meet the day with more attention and less drift.";
+  if (lower.includes("write")) return "Writing seems like one of the ways you stay close to what is yours to say.";
+  if (lower.includes("health") || lower.includes("healthier") || lower.includes("exercise") || lower.includes("move")) {
+    return "You want your body and energy to have a little more support.";
+  }
+  if (lower.includes("leader")) return "You want your presence to help the people around you do better work.";
+  if (lower.includes("parent")) return "You want your parenting to show up in ordinary moments, not just big ones.";
+  if (lower.includes("creator") || lower.includes("create") || lower.includes("make")) {
+    return "You want making things to become a lived practice, not only an idea you carry around.";
+  }
+  return "This sounds like something you want to practice in real life, not just think about.";
+}
+
+function inferQuestPractice(direction: string): { practice: string; cadence: QuestCadence } {
+  const lower = direction.toLowerCase();
+  if (lower.includes("present") && /\b(kids|children|family)\b/.test(lower)) {
+    return {
+      practice: "For one week, put your phone away for the first ten minutes after you reconnect with them.",
+      cadence: "daily"
+    };
+  }
+  if (lower.includes("present")) {
+    return {
+      practice: "Choose one transition each day and enter it without checking your phone for the first few minutes.",
+      cadence: "daily"
+    };
+  }
+  if (lower.includes("write")) {
+    return {
+      practice: "For one week, open a writing document for ten quiet minutes before judging what comes out.",
+      cadence: "daily"
+    };
+  }
+  if (lower.includes("health") || lower.includes("healthier") || lower.includes("exercise") || lower.includes("move")) {
+    return {
+      practice: "Pick one small healthy move each day that you can do even when the day is imperfect.",
+      cadence: "daily"
+    };
+  }
+  if (lower.includes("leader")) {
+    return {
+      practice: "In one conversation this week, ask the question that helps someone else get clearer.",
+      cadence: "weekly"
+    };
+  }
+  if (lower.includes("parent")) {
+    return {
+      practice: "Choose one small daily moment where your attention is fully with your kid before you correct or direct.",
+      cadence: "daily"
+    };
+  }
+  if (lower.includes("creator") || lower.includes("create") || lower.includes("make")) {
+    return {
+      practice: "Set a short making window this week where the only goal is to make one rough version.",
+      cadence: "weekly"
+    };
+  }
+
+  return {
+    practice: `Try one small version of "${shortenQuestText(direction, 54)}" and notice what changes.`,
+    cadence: "weekly"
+  };
+}
+
+function inferQuestCheckInPrompt(direction: string) {
+  const lower = direction.toLowerCase();
+  if (lower.includes("present") && /\b(kids|children|family)\b/.test(lower)) return "What changed when you arrived more fully?";
+  if (lower.includes("present")) return "Where did you feel a little more here today?";
+  if (lower.includes("write")) return "What happened when you made space before judging the writing?";
+  if (lower.includes("health") || lower.includes("healthier")) return "What gave your body or energy a little support?";
+  if (lower.includes("leader")) return "What did your question make clearer?";
+  if (lower.includes("parent")) return "Where did your attention change the moment?";
+  if (lower.includes("creator") || lower.includes("create") || lower.includes("make")) return "What existed after you made the rough version?";
+  return "What did you notice when you tried the practice?";
+}
+
+function inferQuestObstacles(direction: string) {
+  const lower = direction.toLowerCase();
+  if (lower.includes("present")) return ["fatigue", "work residue", "habit of checking messages"];
+  if (lower.includes("write")) return ["perfectionism", "waiting for a big block of time", "judging too early"];
+  if (lower.includes("health") || lower.includes("healthier")) return ["busy days", "all-or-nothing thinking", "low energy"];
+  if (lower.includes("leader")) return ["rushing to solve", "unclear expectations", "taking on too much"];
+  if (lower.includes("parent")) return ["fatigue", "reacting quickly", "competing demands"];
+  if (lower.includes("creator") || lower.includes("create") || lower.includes("make")) return ["overthinking", "comparison", "waiting for the perfect idea"];
+  return ["forgetting", "making it too large", "waiting for perfect conditions"];
+}
+
+function inferQuestEvidence(direction: string) {
+  const lower = direction.toLowerCase();
+  if (lower.includes("present")) return ["you notice more details", "transitions feel less rushed", "connection feels easier"];
+  if (lower.includes("write")) return ["pages exist", "starting feels easier", "you trust rough drafts more"];
+  if (lower.includes("health") || lower.includes("healthier")) return ["more steady energy", "less all-or-nothing pressure", "one healthy choice leads to another"];
+  if (lower.includes("leader")) return ["people leave clearer", "you listen before solving", "the room feels steadier"];
+  if (lower.includes("parent")) return ["you pause before reacting", "small moments feel warmer", "your kid gets more of your attention"];
+  if (lower.includes("creator") || lower.includes("create") || lower.includes("make")) return ["rough versions exist", "momentum returns", "you spend less time only thinking about it"];
+  return ["the practice happens", "it feels a little easier to begin", "you notice what changes"];
+}
+
+function inferQuestNextStep(direction: string) {
+  const lower = direction.toLowerCase();
+  if (lower.includes("present") && /\b(kids|children|family)\b/.test(lower)) return "Choose when the first ten-minute window starts.";
+  if (lower.includes("write")) return "Choose the first ten-minute writing window.";
+  if (lower.includes("health") || lower.includes("healthier")) return "Pick tomorrow's smallest healthy move.";
+  if (lower.includes("leader")) return "Choose the next conversation where you want to practice the better question.";
+  if (lower.includes("parent")) return "Choose one daily moment to meet without distraction.";
+  if (lower.includes("creator") || lower.includes("create") || lower.includes("make")) return "Choose the rough version you can make first.";
+  return "Choose the smallest version you can try this week.";
+}
+
+function shortenQuestText(text: string, maxLength: number) {
+  const trimmed = text.trim().replace(/\s+/g, " ");
+  return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength - 1).trim()}...` : trimmed;
 }
 
 function hasUnclearDecisionContent(text: string) {
@@ -3277,6 +3545,26 @@ function responsibilityPlanMemory(plan: ResponsibilityPlan) {
     `Status: ${plan.status}`,
     "In responsibility/safety mode, prioritize concrete responsible action over reflective questions.",
     "If the user asks what to do or asks for advice, give a bounded action sequence first, then offer help drafting a message, turning it into a checklist, or saving the plan."
+  ];
+
+  return lines.filter(Boolean).join("\n");
+}
+
+function questMemory(quest: Quest) {
+  const lines = [
+    "Quest v1 is active.",
+    `Quest: ${quest.title}`,
+    `Direction: ${quest.direction}`,
+    `Why it matters: ${quest.whyItMatters}`,
+    `Practice: ${quest.practice}`,
+    `Cadence: ${quest.cadence}`,
+    `Check-in question: ${quest.checkInPrompt}`,
+    quest.obstacles.length > 0 ? `What might get in the way: ${quest.obstacles.join(", ")}` : "",
+    quest.evidence.length > 0 ? `Evidence it's working: ${quest.evidence.join(", ")}` : "",
+    quest.nextStep ? `Next step: ${quest.nextStep}` : "",
+    `Status: ${quest.status}`,
+    "A Quest is a small meaning-aligned practice or experiment, not a productivity task.",
+    "Keep Clara human and low-pressure. Do not gamify, promise streaks, or turn this into a complex goal plan."
   ];
 
   return lines.filter(Boolean).join("\n");
@@ -3359,6 +3647,15 @@ function activeResponsibilityPlanForSession(plans: ResponsibilityPlan[], session
   }
 
   return plans.find((plan) => plan.sourceSessionId === session.sessionId && plan.status !== "resolved") ?? null;
+}
+
+function activeQuestForSession(quests: Quest[], session: CurrentSession | null) {
+  if (!session) return null;
+  if (session.activeQuestId) {
+    return quests.find((quest) => quest.id === session.activeQuestId && quest.status === "active") ?? null;
+  }
+
+  return quests.find((quest) => quest.sourceSessionId === session.sessionId && quest.status === "active") ?? null;
 }
 
 function latestSubstantiveUserText(session: CurrentSession) {
@@ -3778,6 +4075,76 @@ function normalizeResponsibilityPlan(value: unknown): ResponsibilityPlan | null 
   };
 }
 
+function isQuestCadence(value: unknown): value is QuestCadence {
+  return value === "once" || value === "daily" || value === "weekly" || value === "custom";
+}
+
+function isQuestStatus(value: unknown): value is QuestStatus {
+  return value === "active" || value === "paused" || value === "completed";
+}
+
+function isQuest(value: unknown): value is Quest {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.createdAt === "string" &&
+    typeof value.updatedAt === "string" &&
+    (value.sourceSessionId === null || typeof value.sourceSessionId === "string") &&
+    typeof value.title === "string" &&
+    typeof value.direction === "string" &&
+    typeof value.whyItMatters === "string" &&
+    typeof value.practice === "string" &&
+    isQuestCadence(value.cadence) &&
+    typeof value.checkInPrompt === "string" &&
+    Array.isArray(value.obstacles) &&
+    value.obstacles.every((item) => typeof item === "string") &&
+    Array.isArray(value.evidence) &&
+    value.evidence.every((item) => typeof item === "string") &&
+    (value.nextStep === null || typeof value.nextStep === "string") &&
+    isQuestStatus(value.status)
+  );
+}
+
+function normalizeQuest(value: unknown): Quest | null {
+  if (!isRecord(value)) return null;
+
+  if (isQuest(value)) {
+    return value;
+  }
+
+  if (typeof value.id !== "string" || typeof value.createdAt !== "string") {
+    return null;
+  }
+
+  const direction = typeof value.direction === "string" && value.direction.trim() ? value.direction : "Practice something that matters";
+
+  return {
+    id: value.id,
+    createdAt: value.createdAt,
+    updatedAt: typeof value.updatedAt === "string" ? value.updatedAt : value.createdAt,
+    sourceSessionId: typeof value.sourceSessionId === "string" ? value.sourceSessionId : null,
+    title: typeof value.title === "string" && value.title.trim() ? value.title : inferQuestTitle(direction),
+    direction,
+    whyItMatters:
+      typeof value.whyItMatters === "string" && value.whyItMatters.trim()
+        ? value.whyItMatters
+        : inferQuestWhyItMatters(direction),
+    practice:
+      typeof value.practice === "string" && value.practice.trim()
+        ? value.practice
+        : inferQuestPractice(direction).practice,
+    cadence: isQuestCadence(value.cadence) ? value.cadence : inferQuestPractice(direction).cadence,
+    checkInPrompt:
+      typeof value.checkInPrompt === "string" && value.checkInPrompt.trim()
+        ? value.checkInPrompt
+        : inferQuestCheckInPrompt(direction),
+    obstacles: cleanStringList(value.obstacles),
+    evidence: cleanStringList(value.evidence),
+    nextStep: typeof value.nextStep === "string" && value.nextStep.trim() ? value.nextStep : inferQuestNextStep(direction),
+    status: isQuestStatus(value.status) ? value.status : "active"
+  };
+}
+
 function normalizeDecisionFrame(value: unknown): DecisionFrame | null {
   if (!isRecord(value)) return null;
 
@@ -3909,6 +4276,10 @@ function normalizeSession(session: CurrentSession): CurrentSession {
       typeof (session as CurrentSession & { activeResponsibilityPlanId?: unknown }).activeResponsibilityPlanId === "string"
         ? (session as CurrentSession & { activeResponsibilityPlanId: string }).activeResponsibilityPlanId
         : null,
+    activeQuestId:
+      typeof (session as CurrentSession & { activeQuestId?: unknown }).activeQuestId === "string"
+        ? (session as CurrentSession & { activeQuestId: string }).activeQuestId
+        : null,
     awaitingRouteChoice:
       typeof (session as CurrentSession & { awaitingRouteChoice?: unknown }).awaitingRouteChoice === "boolean"
         ? (session as CurrentSession & { awaitingRouteChoice: boolean }).awaitingRouteChoice
@@ -4027,6 +4398,21 @@ function readResponsibilityPlansFromStorage(): ResponsibilityPlan[] {
   return [];
 }
 
+function readQuestsFromStorage(): Quest[] {
+  const storedQuests = window.localStorage.getItem(STORAGE_KEYS.quests);
+  const parsedQuests = parseStoredJson<unknown>(storedQuests);
+
+  if (Array.isArray(parsedQuests)) {
+    return parsedQuests.map(normalizeQuest).filter((quest): quest is Quest => quest !== null);
+  }
+
+  if (storedQuests) {
+    window.localStorage.removeItem(STORAGE_KEYS.quests);
+  }
+
+  return [];
+}
+
 function clearPrototypeStorage() {
   Object.values(STORAGE_KEYS).forEach((key) => window.localStorage.removeItem(key));
 
@@ -4053,6 +4439,7 @@ function legacyEntriesToSessions(entries: LegacyEntry[]): CompletedSession[] {
     conversationRoute: "meaning_moment",
     activeDecisionFrameId: null,
     activeResponsibilityPlanId: null,
+    activeQuestId: null,
     awaitingRouteChoice: false,
     tags: entry.tags,
     summary: entry.response,
@@ -4086,6 +4473,7 @@ export default function Home() {
   const [meaningNotes, setMeaningNotes] = useState<MeaningNote[]>([]);
   const [decisionFrames, setDecisionFrames] = useState<DecisionFrame[]>([]);
   const [responsibilityPlans, setResponsibilityPlans] = useState<ResponsibilityPlan[]>([]);
+  const [quests, setQuests] = useState<Quest[]>([]);
   const [pendingMeaningNote, setPendingMeaningNote] = useState<MeaningNote | null>(null);
   const [meaningNoteDraftText, setMeaningNoteDraftText] = useState("");
   const [meaningNoteMode, setMeaningNoteMode] = useState<MeaningNoteMode>("review");
@@ -4109,6 +4497,7 @@ export default function Home() {
     const parsedMeaningNotes = readMeaningNotesFromStorage();
     const parsedDecisionFrames = readDecisionFramesFromStorage();
     const parsedResponsibilityPlans = readResponsibilityPlansFromStorage();
+    const parsedQuests = readQuestsFromStorage();
 
     if (parsedProfile) {
       setProfile(parsedProfile);
@@ -4120,6 +4509,7 @@ export default function Home() {
     setMeaningNotes(parsedMeaningNotes);
     setDecisionFrames(parsedDecisionFrames);
     setResponsibilityPlans(parsedResponsibilityPlans);
+    setQuests(parsedQuests);
 
     if (parsedSession) {
       if (parsedSession.status === "active" && isToday(parsedSession.startedAt)) {
@@ -4157,6 +4547,12 @@ export default function Home() {
       window.localStorage.setItem(STORAGE_KEYS.responsibilityPlans, JSON.stringify(responsibilityPlans));
     }
   }, [responsibilityPlans, ready]);
+
+  useEffect(() => {
+    if (ready) {
+      window.localStorage.setItem(STORAGE_KEYS.quests, JSON.stringify(quests));
+    }
+  }, [quests, ready]);
 
   useEffect(() => {
     if (!ready) return;
@@ -4321,6 +4717,71 @@ export default function Home() {
       }
     }
 
+    if (isQuestOfferMessage(latestClara)) {
+      const sessionWithChoice: CurrentSession = {
+        ...currentSession,
+        conversationRoute: "quest_goal",
+        awaitingRouteChoice: false,
+        messages: [...currentSession.messages, makeUserMessage(trimmed)]
+      };
+
+      if (isQuestConfirmChoice(trimmed)) {
+        const aspirationText = latestQuestAspirationText(currentSession) || sessionText(currentSession) || trimmed;
+        const quest = questFromText(aspirationText, currentSession);
+        console.log("Quest created", quest);
+        setQuests((current) => [quest, ...current.filter((item) => item.id !== quest.id)]);
+        setCurrentSession({
+          ...sessionWithChoice,
+          activeQuestId: quest.id,
+          messages: [
+            ...sessionWithChoice.messages,
+            makeClaraMessage({
+              text: questCreatedText(quest),
+              expectedInput: "choice",
+              choices: ["Keep going", "Done for today"]
+            })
+          ]
+        });
+        setAnswer("");
+        return;
+      }
+
+      if (isQuestDeclineChoice(trimmed)) {
+        setCurrentSession({
+          ...sessionWithChoice,
+          messages: [
+            ...sessionWithChoice.messages,
+            makeClaraMessage({
+              text: "Okay. We can leave it as an intention for now.",
+              expectedInput: "none"
+            })
+          ]
+        });
+        setAnswer("");
+        return;
+      }
+
+      if (isQuestContinueChoice(trimmed)) {
+        const routeClassification = routeMetadata("quest_goal", 0.95, "The user wants to keep exploring the aspiration before making a quest.");
+        const claraResult = await generateClaraFromConversation(sessionWithChoice, profile, sessions, {
+          userIntent: "explicit_continue",
+          routeClassification
+        });
+        setCurrentSession({
+          ...sessionWithChoice,
+          messages: [
+            ...sessionWithChoice.messages,
+            makeClaraMessage({
+              text: claraResult.text,
+              expectedInput: "text"
+            })
+          ]
+        });
+        setAnswer("");
+        return;
+      }
+    }
+
     const activeFrameForControl = activeDecisionFrameForSession(decisionFrames, currentSession);
     const frameControlChoice = activeFrameForControl ? decisionControlChoice(trimmed) : null;
 
@@ -4371,6 +4832,12 @@ export default function Home() {
     const detectedUserIntent = detectUserIntent(trimmed, currentSession);
     const currentlyInDecisionLoop =
       isDecisionRoute(currentSession.conversationRoute) || activeDecisionFrameForSession(decisionFrames, currentSession) !== null;
+    const currentlyInQuestLoop = currentSession.conversationRoute === "quest_goal" || activeQuestForSession(quests, currentSession) !== null;
+    const artifactCloseText = currentlyInQuestLoop
+      ? "Saved. You can find this under Map."
+      : currentlyInDecisionLoop
+        ? "Saved. You can come back to this from Frames."
+        : null;
     console.log("detectedUserIntent", detectedUserIntent);
 
     if (detectedUserIntent === "polite_close") {
@@ -4383,18 +4850,12 @@ export default function Home() {
     if (detectedUserIntent === "explicit_stop") {
       const closeReason = "explicit_stop";
       console.log("closeReason", closeReason);
-      await closeSession(
-        trimmed,
-        currentlyInDecisionLoop ? "Saved. You can come back to this from Frames." : "Of course. I'll save this for now."
-      );
+      await closeSession(trimmed, artifactCloseText ?? "Of course. I'll save this for now.");
       return;
     }
 
     if (detectedUserIntent === "save") {
-      await closeSession(
-        trimmed,
-        currentlyInDecisionLoop ? "Saved. You can come back to this from Frames." : "Saved. That's a good place to leave it for today."
-      );
+      await closeSession(trimmed, artifactCloseText ?? "Saved. That's a good place to leave it for today.");
       return;
     }
 
@@ -4423,10 +4884,7 @@ export default function Home() {
     }
 
     if (isSaveChoice(trimmed)) {
-      await closeSession(
-        trimmed,
-        currentlyInDecisionLoop ? "Saved. You can come back to this from Frames." : "Saved. That's a good place to leave it for today."
-      );
+      await closeSession(trimmed, artifactCloseText ?? "Saved. That's a good place to leave it for today.");
       return;
     }
 
@@ -4437,6 +4895,7 @@ export default function Home() {
     };
     const existingDecisionFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
     const existingResponsibilityPlan = activeResponsibilityPlanForSession(responsibilityPlans, currentSession);
+    const existingQuest = activeQuestForSession(quests, currentSession);
     const routeClassification = await classifyRoute(trimmed, sessionWithReply, profile, sessions, existingDecisionFrame);
     const routedAs = routeClassification.route;
     console.log("Clara route classification", routeClassification);
@@ -4464,11 +4923,13 @@ export default function Home() {
     let decisionFrame = newDecisionFrame ?? existingDecisionFrame;
     let decisionFrameUpdate: DecisionFrameUpdate | null = null;
     let responsibilityPlan: ResponsibilityPlan | null = null;
+    let quest: Quest | null = existingQuest;
     let routedSession: CurrentSession = {
       ...sessionWithReply,
       conversationRoute: routedAs,
       activeDecisionFrameId: decisionFrame?.id ?? sessionWithReply.activeDecisionFrameId,
       activeResponsibilityPlanId: sessionWithReply.activeResponsibilityPlanId,
+      activeQuestId: quest?.id ?? sessionWithReply.activeQuestId,
       awaitingRouteChoice: false
     };
 
@@ -4511,6 +4972,22 @@ export default function Home() {
       };
     }
 
+    if (routedAs === "quest_goal" && !quest) {
+      setCurrentSession({
+        ...routedSession,
+        messages: [
+          ...routedSession.messages,
+          makeClaraMessage({
+            text: "That sounds like something worth practicing, not just thinking about. Want to turn it into a small quest for the week?",
+            expectedInput: "choice",
+            choices: ["Make it a quest", "Keep talking", "Not now"]
+          })
+        ]
+      });
+      setAnswer("");
+      return;
+    }
+
     if (shouldCloseForDepth(routedSession, trimmed)) {
       await closeSession(trimmed, "That's a good place to leave it for today.");
       return;
@@ -4530,6 +5007,7 @@ export default function Home() {
         decisionFrame,
         decisionFrameUpdate,
         responsibilityPlan,
+        quest,
         routeClassification
       });
       setCurrentSession(
@@ -4557,6 +5035,7 @@ export default function Home() {
         decisionFrame,
         decisionFrameUpdate,
         responsibilityPlan,
+        quest,
         routeClassification
       });
       setCurrentSession(
@@ -4584,6 +5063,7 @@ export default function Home() {
       decisionFrame,
       decisionFrameUpdate,
       responsibilityPlan,
+      quest,
       routeClassification
     });
     setCurrentSession(
@@ -4787,13 +5267,17 @@ export default function Home() {
 
     const activeFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
     const activeResponsibilityPlan = activeResponsibilityPlanForSession(responsibilityPlans, currentSession);
+    const activeQuest = activeQuestForSession(quests, currentSession);
     const isDecisionSession = isDecisionRoute(currentSession.conversationRoute) || activeFrame !== null;
     const isResponsibilitySession = currentSession.conversationRoute === "responsibility_safety" || activeResponsibilityPlan !== null;
+    const isQuestSession = currentSession.conversationRoute === "quest_goal" || activeQuest !== null;
     const finalClaraText =
       claraText ??
-      (isDecisionSession || isResponsibilitySession
-        ? "Saved. You can come back to this from Frames."
-        : "That's a good place to leave it for today.");
+      (isQuestSession
+        ? "Saved. You can find this under Map."
+        : isDecisionSession || isResponsibilitySession
+          ? "Saved. You can come back to this from Frames."
+          : "That's a good place to leave it for today.");
     const now = new Date().toISOString();
     const messages = choiceText
       ? [
@@ -4849,6 +5333,22 @@ export default function Home() {
                   updatedAt: now
                 }
               : plan
+          )
+        );
+      }
+      return;
+    }
+
+    if (isQuestSession) {
+      if (activeQuest) {
+        setQuests((current) =>
+          current.map((quest) =>
+            quest.id === activeQuest.id
+              ? {
+                  ...quest,
+                  updatedAt: now
+                }
+              : quest
           )
         );
       }
@@ -5153,6 +5653,7 @@ export default function Home() {
   const currentSessionIsTouchpoint = currentSession?.touchpointType && currentSession.touchpointType !== "daily_check_in";
   const activeDecisionFrame = activeDecisionFrameForSession(decisionFrames, currentSession);
   const activeResponsibilityPlan = activeResponsibilityPlanForSession(responsibilityPlans, currentSession);
+  const activeQuest = activeQuestForSession(quests, currentSession);
   const selectedDecisionFrame =
     selectedDecisionFrameId ? decisionFrames.find((frame) => frame.id === selectedDecisionFrameId) ?? null : null;
 
@@ -5226,6 +5727,7 @@ export default function Home() {
             <>
               {activeDecisionFrame ? <FrameSoFarCard frame={activeDecisionFrame} /> : null}
               {!activeDecisionFrame && activeResponsibilityPlan ? <ResponsibilityPlanSoFarCard plan={activeResponsibilityPlan} /> : null}
+              {!activeDecisionFrame && !activeResponsibilityPlan && activeQuest ? <QuestSoFarCard quest={activeQuest} /> : null}
 
               <section className="space-y-4">
                 {currentSession.messages.map((message, index) => (
@@ -5429,6 +5931,19 @@ export default function Home() {
               <EmptyState text="Saved Meaning Notes will gather here after you finish a check-in or moment." />
             ) : (
               meaningNotes.map((note) => <MeaningNoteCard note={note} key={note.id} />)
+            )}
+          </section>
+          <section className="space-y-5 border-t border-pearl/10 pt-6">
+            <div className="space-y-1">
+              <p className="text-sm uppercase tracking-[0.2em] text-clay">Quests</p>
+              <p className="text-base leading-6 text-fog">
+                Small practices that turn what matters into something you can try.
+              </p>
+            </div>
+            {quests.length === 0 ? (
+              <EmptyState text="Quests will appear here when Clara helps turn an aspiration into a small practice." />
+            ) : (
+              quests.map((quest) => <QuestCard quest={quest} key={quest.id} />)
             )}
           </section>
         </section>
@@ -5781,6 +6296,50 @@ function MeaningNoteCard({ note }: { note: MeaningNote }) {
   );
 }
 
+function QuestCard({ quest }: { quest: Quest }) {
+  return (
+    <article className="space-y-4 border-t border-pearl/10 pt-5">
+      <div className="flex items-center justify-between gap-4 text-sm text-fog">
+        <span>{formatDate(quest.createdAt)}</span>
+        <span>{quest.status}</span>
+      </div>
+      <p className="text-sm uppercase tracking-[0.18em] text-clay">Quest</p>
+      <p className="text-2xl leading-9 text-pearl">{quest.title}</p>
+      <QuestText label="Direction" value={quest.direction} />
+      <QuestText label="Why it matters" value={quest.whyItMatters} />
+      <QuestText label="Practice" value={quest.practice} />
+      <QuestText label="When to try it" value={formatQuestCadence(quest.cadence)} />
+      <QuestText label="Check-in question" value={quest.checkInPrompt} />
+      <QuestList label="What might get in the way" values={quest.obstacles} />
+      <QuestList label="Evidence it's working" values={quest.evidence} />
+      <QuestText label="Next step" value={quest.nextStep || "Not clear yet."} />
+      <QuestText label="Status" value={quest.status} />
+    </article>
+  );
+}
+
+function QuestText({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="space-y-1">
+      <p className="text-sm text-clay">{label}</p>
+      <p className="text-lg leading-7 text-fog">{value}</p>
+    </div>
+  );
+}
+
+function QuestList({ label, values }: { label: string; values: string[] }) {
+  return (
+    <div className="space-y-2">
+      <p className="text-sm text-clay">{label}</p>
+      {values.length === 0 ? (
+        <p className="text-lg leading-7 text-fog">Not clear yet.</p>
+      ) : (
+        <TagList values={values} />
+      )}
+    </div>
+  );
+}
+
 function FrameSoFarCard({ frame }: { frame: DecisionFrame }) {
   return (
     <details className="rounded-md border border-pearl/10 bg-pearl/7 p-4" open>
@@ -5834,6 +6393,37 @@ function ResponsibilityPlanSoFarCard({ plan }: { plan: ResponsibilityPlan }) {
         <CompactFrameSection label="Next steps" values={plan.nextSteps} />
         <CompactFrameSection label="People to contact" values={plan.peopleToContact} />
         <CompactFrameSection label="Policy to check" values={plan.policiesToCheck} />
+      </div>
+    </details>
+  );
+}
+
+function QuestSoFarCard({ quest }: { quest: Quest }) {
+  return (
+    <details className="rounded-md border border-pearl/10 bg-pearl/7 p-4" open>
+      <summary className="cursor-pointer text-sm uppercase tracking-[0.18em] text-clay">Quest so far</summary>
+      <div className="mt-4 space-y-3">
+        <p className="text-sm leading-6 text-fog">
+          Quests are small meaning-aligned practices. No streaks, no pressure, just a way to try what matters.
+        </p>
+        <div className="space-y-1">
+          <p className="text-sm text-clay">Quest</p>
+          <p className="text-base leading-6 text-pearl">{quest.title}</p>
+        </div>
+        <div className="space-y-1">
+          <p className="text-sm text-clay">Practice</p>
+          <p className="text-base leading-6 text-fog">{quest.practice}</p>
+        </div>
+        <div className="space-y-1">
+          <p className="text-sm text-clay">When to try it</p>
+          <p className="text-base leading-6 text-fog">{formatQuestCadence(quest.cadence)}</p>
+        </div>
+        {quest.nextStep ? (
+          <div className="space-y-1">
+            <p className="text-sm text-clay">Next step</p>
+            <p className="text-base leading-6 text-fog">{quest.nextStep}</p>
+          </div>
+        ) : null}
       </div>
     </details>
   );
@@ -6295,6 +6885,13 @@ function ResponsibilityPlanList({ label, values }: { label: string; values: stri
 
 function formatDecisionType(type: DecisionFrameType) {
   return capitalize(type);
+}
+
+function formatQuestCadence(cadence: QuestCadence) {
+  if (cadence === "once") return "Once";
+  if (cadence === "daily") return "Daily";
+  if (cadence === "weekly") return "Weekly";
+  return "Custom";
 }
 
 function formatFrameStage(stage: DecisionFrameStage) {

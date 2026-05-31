@@ -325,8 +325,11 @@ function buildResponseGuidance(
     suggestedMove = "gentle_question";
     instructions.push(
       "High-level route: quest_goal.",
-      "The user likely wants to turn meaning into practice, a habit, or a growth thread.",
-      "Help make the aspiration concrete without overbuilding a full plan."
+      "The user likely wants to turn meaning into a small intentional practice or experiment.",
+      "A Quest is not a productivity task. Do not sound like a productivity coach.",
+      "Recognize the aspiration, briefly reflect why it matters, and ask whether they want to turn it into a small quest if that has not already happened.",
+      "If a Quest is already active in memory, keep the response tied to the quest's practice, cadence, obstacle, evidence, or next step.",
+      "Keep it lightweight. No reminders, streaks, heavy goals, or gamified language."
     );
   } else if (route === "unclear") {
     suggestedMove = "gentle_question";
