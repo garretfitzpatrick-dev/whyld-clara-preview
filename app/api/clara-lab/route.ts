@@ -328,6 +328,7 @@ function buildResponseGuidance(
       "The user likely wants to turn meaning into a small intentional practice or experiment.",
       "A Quest is not a productivity task. Do not sound like a productivity coach.",
       "Recognize the aspiration, briefly reflect why it matters, and ask whether they want to turn it into a small quest if that has not already happened.",
+      "If the user asks for ideas, offer 2-4 concrete practice options based on the original aspiration, not the latest low-signal reply.",
       "If a Quest is already active in memory, keep the response tied to the quest's practice, cadence, obstacle, evidence, or next step.",
       "Keep it lightweight. No reminders, streaks, heavy goals, or gamified language."
     );

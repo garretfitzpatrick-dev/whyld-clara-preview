@@ -106,6 +106,14 @@ type UserMessage = BaseMessage & {
 
 type ConversationMessage = ClaraMessage | UserMessage;
 
+type QuestSeed = {
+  originalAspiration: string;
+  direction: string;
+  peopleOrContext: string[];
+  possiblePractices: string[];
+  selectedPractice?: string | null;
+};
+
 type CurrentSession = {
   sessionId: string;
   startedAt: string;
@@ -126,6 +134,7 @@ type CurrentSession = {
   activeDecisionFrameId: string | null;
   activeResponsibilityPlanId: string | null;
   activeQuestId: string | null;
+  questSeed: QuestSeed | null;
   awaitingRouteChoice: boolean;
 };
 
@@ -627,6 +636,7 @@ function createSession(
     activeDecisionFrameId: null,
     activeResponsibilityPlanId: null,
     activeQuestId: null,
+    questSeed: null,
     awaitingRouteChoice: false
   };
 }
@@ -1415,6 +1425,7 @@ function emptyIntentSession(): CurrentSession {
     activeDecisionFrameId: null,
     activeResponsibilityPlanId: null,
     activeQuestId: null,
+    questSeed: null,
     awaitingRouteChoice: false
   };
 }
@@ -3283,8 +3294,18 @@ function isQuestContinueChoice(text: string) {
 }
 
 function questFromText(text: string, session: CurrentSession): Quest {
-  const direction = inferQuestDirection(text || latestQuestAspirationText(session));
-  const practice = inferQuestPractice(direction);
+  return questFromSeed(questSeedFromText(text || latestQuestAspirationText(session)), session);
+}
+
+function questFromSeed(seed: QuestSeed, session: CurrentSession): Quest {
+  const direction = seed.direction || inferQuestDirection(seed.originalAspiration);
+  const selectedPractice = bestQuestPractice(seed);
+  const practice = selectedPractice
+    ? {
+        practice: selectedPractice,
+        cadence: inferQuestCadence(direction, selectedPractice)
+      }
+    : inferQuestPractice(direction);
   const now = new Date().toISOString();
 
   return {
@@ -3305,6 +3326,20 @@ function questFromText(text: string, session: CurrentSession): Quest {
   };
 }
 
+function validatedQuestFromSeed(seed: QuestSeed, session: CurrentSession): Quest | null {
+  const enrichedSeed = seed.possiblePractices.length > 0 ? seed : enrichQuestSeedWithPracticeOptions(seed);
+  const quest = questFromSeed(enrichedSeed, session);
+
+  if (isValidQuest(quest, enrichedSeed)) return quest;
+
+  const regeneratedSeed: QuestSeed = {
+    ...enrichedSeed,
+    selectedPractice: enrichedSeed.possiblePractices[0] ?? inferQuestPractice(enrichedSeed.direction).practice
+  };
+  const regeneratedQuest = questFromSeed(regeneratedSeed, session);
+  return isValidQuest(regeneratedQuest, regeneratedSeed) ? regeneratedQuest : null;
+}
+
 function questCreatedText(quest: Quest) {
   return `Quest created: ${quest.title}. Try this ${formatQuestCadence(quest.cadence).toLowerCase()}: ${quest.practice}`;
 }
@@ -3316,13 +3351,249 @@ function latestQuestAspirationText(session: CurrentSession) {
       .find(
         (message) =>
           message.role === "user" &&
-          !isQuestConfirmChoice(message.text) &&
-          !isQuestDeclineChoice(message.text) &&
-          !isQuestContinueChoice(message.text) &&
-          !isAcknowledgement(message.text) &&
-          !isStoppingSignal(message.text)
+          !isQuestControlMessage(message.text) &&
+          isQuestGoalMoment(message.text)
       )?.text ?? ""
   );
+}
+
+function questSeedFromText(text: string): QuestSeed {
+  const originalAspiration = text.trim();
+  const direction = inferQuestDirection(originalAspiration);
+
+  return {
+    originalAspiration,
+    direction,
+    peopleOrContext: inferQuestPeopleOrContext(originalAspiration),
+    possiblePractices: [],
+    selectedPractice: null
+  };
+}
+
+function questSeedForSession(session: CurrentSession, latestText: string) {
+  if (session.questSeed) return session.questSeed;
+
+  const seedText = !isQuestControlMessage(latestText)
+    ? latestText
+    : latestQuestAspirationText(session) || sessionText(session);
+
+  return questSeedFromText(seedText);
+}
+
+function enrichQuestSeedWithPracticeOptions(seed: QuestSeed): QuestSeed {
+  const possiblePractices = seed.possiblePractices.length > 0 ? seed.possiblePractices : inferQuestPracticeOptions(seed.direction);
+
+  return {
+    ...seed,
+    possiblePractices
+  };
+}
+
+function selectQuestPractice(seed: QuestSeed, choice: string): QuestSeed {
+  const practice = questPracticeFromChoice(seed, choice);
+
+  return {
+    ...enrichQuestSeedWithPracticeOptions(seed),
+    selectedPractice: practice
+  };
+}
+
+function bestQuestPractice(seed: QuestSeed) {
+  return seed.selectedPractice || seed.possiblePractices[0] || null;
+}
+
+function isQuestControlMessage(text: string) {
+  const normalized = normalizeChoice(text);
+
+  return (
+    isQuestConfirmChoice(text) ||
+    isQuestDeclineChoice(text) ||
+    isQuestContinueChoice(text) ||
+    isAcknowledgement(text) ||
+    isStoppingSignal(text) ||
+    isQuestPracticeIdeaRequest(text) ||
+    ["i'm not sure", "im not sure", "not sure", "i don't know", "i dont know", "do you have any ideas", "give me ideas"].includes(
+      normalized
+    )
+  );
+}
+
+function isQuestPracticeIdeaRequest(text: string) {
+  const normalized = normalizeChoice(text);
+  const lower = text.toLowerCase();
+
+  return (
+    normalized === "i'm not sure" ||
+    normalized === "im not sure" ||
+    normalized === "not sure" ||
+    normalized === "i don't know" ||
+    normalized === "i dont know" ||
+    /\bi'?m not sure\b/.test(lower) ||
+    /\bi don'?t know\b/.test(lower) ||
+    /\bdo you have any ideas\b/.test(lower) ||
+    /\bwhat could i try\b/.test(lower) ||
+    /\bgive me ideas\b/.test(lower) ||
+    /\bany ideas\b/.test(lower)
+  );
+}
+
+function inferQuestPeopleOrContext(text: string) {
+  const lower = text.toLowerCase();
+  const context: string[] = [];
+
+  if (/\b(kids|children)\b/.test(lower)) context.push("kids", "family time");
+  if (/\bfamily\b/.test(lower)) context.push("family time");
+  if (/\bwork|team|leader|leadership\b/.test(lower)) context.push("work", "leadership");
+  if (/\bwrite|writing\b/.test(lower)) context.push("writing");
+  if (/\bhealth|healthier|exercise|move|sleep|eat\b/.test(lower)) context.push("health");
+  if (/\bcreate|creator|creative|make\b/.test(lower)) context.push("creative work");
+
+  return uniqueStrings(context);
+}
+
+function inferQuestPracticeOptions(direction: string) {
+  const lower = direction.toLowerCase();
+
+  if (lower.includes("present") && /\b(kids|children|family)\b/.test(lower)) {
+    return [
+      "Put your phone away for the first ten minutes after you get home and give your kids your full attention.",
+      "Ask one follow-up question before giving advice or moving on.",
+      "Do one thing with them without multitasking.",
+      "Let them choose a ten-minute activity and fully join it."
+    ];
+  }
+
+  if (lower.includes("present")) {
+    return [
+      "Choose one daily transition and spend the first few minutes without checking your phone.",
+      "Take one slow breath before entering the next room, meeting, or conversation.",
+      "Notice three concrete details before reaching for the next thing."
+    ];
+  }
+
+  if (lower.includes("write")) {
+    return [
+      "Open a writing document for ten quiet minutes before judging what comes out.",
+      "Write one rough paragraph before checking messages.",
+      "Keep a tiny note of one sentence you might want to expand later."
+    ];
+  }
+
+  if (lower.includes("health") || lower.includes("healthier") || lower.includes("exercise") || lower.includes("move")) {
+    return [
+      "Choose one ten-minute walk or stretch you can do even on an imperfect day.",
+      "Pick one meal or snack where you make the next healthy choice.",
+      "Set a simple bedtime cue and try it once this week."
+    ];
+  }
+
+  if (lower.includes("leader")) {
+    return [
+      "Ask one clarifying question before offering your own answer.",
+      "Name the outcome you want before the next important conversation.",
+      "Give one person clearer context before asking for work."
+    ];
+  }
+
+  if (lower.includes("parent")) {
+    return [
+      "Give one small moment your full attention before correcting or directing.",
+      "Ask one follow-up question before giving advice.",
+      "Create a ten-minute window where your kid gets your full attention."
+    ];
+  }
+
+  if (lower.includes("creator") || lower.includes("create") || lower.includes("make")) {
+    return [
+      "Make one rough version before deciding whether it is good.",
+      "Spend twenty minutes making without editing.",
+      "Share one unfinished piece with someone safe."
+    ];
+  }
+
+  return [
+    `Try one small version of "${shortenQuestText(direction, 54)}" and notice what changes.`,
+    "Make the practice small enough to do once this week.",
+    "Choose one moment where this direction can become visible."
+  ];
+}
+
+function questPracticeChoiceLabels(seed: QuestSeed) {
+  return enrichQuestSeedWithPracticeOptions(seed).possiblePractices.map(questPracticeLabel).slice(0, 4);
+}
+
+function questPracticeLabel(practice: string) {
+  const lower = practice.toLowerCase();
+  if (lower.includes("first ten minutes") || lower.includes("ten-minute window")) return "First ten minutes";
+  if (lower.includes("follow-up question")) return "One follow-up question";
+  if (lower.includes("without multitasking")) return "No multitasking";
+  if (lower.includes("choose a ten-minute activity")) return "Kid chooses activity";
+  if (lower.includes("writing document")) return "Ten-minute writing";
+  if (lower.includes("rough paragraph")) return "One rough paragraph";
+  if (lower.includes("ten-minute walk")) return "Ten-minute walk";
+  if (lower.includes("clarifying question")) return "Clarifying question";
+  if (lower.includes("rough version")) return "Rough version";
+  return shortenQuestText(practice.replace(/^For one week,\s*/i, ""), 28);
+}
+
+function questPracticeFromChoice(seed: QuestSeed, choice: string) {
+  const enrichedSeed = enrichQuestSeedWithPracticeOptions(seed);
+  const normalizedChoice = normalizeChoice(choice);
+
+  return (
+    enrichedSeed.possiblePractices.find((practice) => normalizeChoice(questPracticeLabel(practice)) === normalizedChoice) ??
+    enrichedSeed.possiblePractices[0] ??
+    inferQuestPractice(enrichedSeed.direction).practice
+  );
+}
+
+function isQuestPracticeChoice(text: string, seed: QuestSeed | null) {
+  if (!seed) return false;
+  const labels = questPracticeChoiceLabels(seed);
+  return labels.some((label) => normalizeChoice(label) === normalizeChoice(text));
+}
+
+function questIdeasText(seed: QuestSeed) {
+  const practices = enrichQuestSeedWithPracticeOptions(seed).possiblePractices.slice(0, 4);
+  const numbered = practices.map((practice, index) => `${index + 1}. ${practice}`).join("\n");
+
+  return `Yes. A few small ones:\n${numbered}\n\nWant to make one of these a quest?`;
+}
+
+function isValidQuest(quest: Quest, seed: QuestSeed) {
+  const lowerTitle = quest.title.toLowerCase();
+  const lowerPractice = quest.practice.toLowerCase();
+  const directionWords = meaningfulQuestWords(seed.direction);
+  const practiceWords = meaningfulQuestWords(quest.practice);
+  const relatesToDirection =
+    seed.possiblePractices.includes(quest.practice) ||
+    directionWords.length === 0 ||
+    directionWords.some((word) => practiceWords.includes(word)) ||
+    lowerPractice.includes("phone") ||
+    lowerPractice.includes("ten");
+
+  return (
+    !isQuestControlMessage(quest.title) &&
+    !["i'm not sure", "im not sure", "not sure"].includes(normalizeChoice(quest.title)) &&
+    !lowerTitle.includes("do you have any ideas") &&
+    !isQuestPracticeIdeaRequest(quest.practice) &&
+    !/[?]$/.test(quest.practice.trim()) &&
+    hasConcreteQuestAction(quest.practice) &&
+    relatesToDirection
+  );
+}
+
+function meaningfulQuestWords(text: string) {
+  const stopWords = new Set(["want", "more", "better", "be", "with", "the", "and", "for", "this", "that", "your", "you"]);
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((word) => word.length > 2 && !stopWords.has(word));
+}
+
+function hasConcreteQuestAction(text: string) {
+  return /\b(put|ask|do|let|choose|open|write|keep|pick|set|take|notice|make|spend|share|give|name|try|create)\b/i.test(text);
 }
 
 function inferQuestDirection(text: string) {
@@ -3436,6 +3707,15 @@ function inferQuestPractice(direction: string): { practice: string; cadence: Que
     practice: `Try one small version of "${shortenQuestText(direction, 54)}" and notice what changes.`,
     cadence: "weekly"
   };
+}
+
+function inferQuestCadence(direction: string, practice: string): QuestCadence {
+  const lower = `${direction} ${practice}`.toLowerCase();
+
+  if (/\b(today|once|one time|this conversation|next conversation)\b/.test(lower)) return "once";
+  if (/\bdaily|each day|every day|after you get home|first ten minutes|phone away|one small daily\b/.test(lower)) return "daily";
+  if (/\bweek|weekly|this week|one conversation|rough version|making window\b/.test(lower)) return "weekly";
+  return "weekly";
 }
 
 function inferQuestCheckInPrompt(direction: string) {
@@ -3775,6 +4055,22 @@ function sessionTouchpointContext(session: CurrentSession) {
     lines.push(`Moment context: ${session.momentKind}`);
   }
 
+  if (session.questSeed) {
+    lines.push("Quest seed:");
+    lines.push(`Original aspiration: ${session.questSeed.originalAspiration}`);
+    lines.push(`Direction: ${session.questSeed.direction}`);
+    if (session.questSeed.peopleOrContext.length > 0) {
+      lines.push(`People/context: ${session.questSeed.peopleOrContext.join(", ")}`);
+    }
+    if (session.questSeed.possiblePractices.length > 0) {
+      lines.push(`Possible practices: ${session.questSeed.possiblePractices.join(" | ")}`);
+    }
+    if (session.questSeed.selectedPractice) {
+      lines.push(`Selected practice: ${session.questSeed.selectedPractice}`);
+    }
+    lines.push("Do not treat low-signal replies like 'I'm not sure' or 'Do you have any ideas?' as the quest direction.");
+  }
+
   return lines.join("\n");
 }
 
@@ -3928,6 +4224,19 @@ function isConversationMessage(value: unknown): value is ConversationMessage {
   }
 
   return false;
+}
+
+function isQuestSeed(value: unknown): value is QuestSeed {
+  return (
+    isRecord(value) &&
+    typeof value.originalAspiration === "string" &&
+    typeof value.direction === "string" &&
+    Array.isArray(value.peopleOrContext) &&
+    value.peopleOrContext.every((item) => typeof item === "string") &&
+    Array.isArray(value.possiblePractices) &&
+    value.possiblePractices.every((item) => typeof item === "string") &&
+    (value.selectedPractice === undefined || value.selectedPractice === null || typeof value.selectedPractice === "string")
+  );
 }
 
 function isCurrentSession(value: unknown): value is CurrentSession {
@@ -4280,6 +4589,18 @@ function normalizeSession(session: CurrentSession): CurrentSession {
       typeof (session as CurrentSession & { activeQuestId?: unknown }).activeQuestId === "string"
         ? (session as CurrentSession & { activeQuestId: string }).activeQuestId
         : null,
+    questSeed: isQuestSeed((session as CurrentSession & { questSeed?: unknown }).questSeed)
+      ? {
+          ...(session as CurrentSession & { questSeed: QuestSeed }).questSeed,
+          peopleOrContext: cleanStringList((session as CurrentSession & { questSeed: QuestSeed }).questSeed.peopleOrContext),
+          possiblePractices: cleanStringList((session as CurrentSession & { questSeed: QuestSeed }).questSeed.possiblePractices),
+          selectedPractice:
+            typeof (session as CurrentSession & { questSeed: QuestSeed }).questSeed.selectedPractice === "string" &&
+            (session as CurrentSession & { questSeed: QuestSeed }).questSeed.selectedPractice?.trim()
+              ? (session as CurrentSession & { questSeed: QuestSeed }).questSeed.selectedPractice
+              : null
+        }
+      : null,
     awaitingRouteChoice:
       typeof (session as CurrentSession & { awaitingRouteChoice?: unknown }).awaitingRouteChoice === "boolean"
         ? (session as CurrentSession & { awaitingRouteChoice: boolean }).awaitingRouteChoice
@@ -4440,6 +4761,7 @@ function legacyEntriesToSessions(entries: LegacyEntry[]): CompletedSession[] {
     activeDecisionFrameId: null,
     activeResponsibilityPlanId: null,
     activeQuestId: null,
+    questSeed: null,
     awaitingRouteChoice: false,
     tags: entry.tags,
     summary: entry.response,
@@ -4718,16 +5040,71 @@ export default function Home() {
     }
 
     if (isQuestOfferMessage(latestClara)) {
+      const currentSeed = currentSession.questSeed ?? questSeedForSession(currentSession, trimmed);
+      const enrichedSeed = enrichQuestSeedWithPracticeOptions(currentSeed);
       const sessionWithChoice: CurrentSession = {
         ...currentSession,
         conversationRoute: "quest_goal",
+        questSeed: enrichedSeed,
         awaitingRouteChoice: false,
         messages: [...currentSession.messages, makeUserMessage(trimmed)]
       };
 
+      if (isQuestPracticeChoice(trimmed, enrichedSeed)) {
+        const selectedSeed = selectQuestPractice(enrichedSeed, trimmed);
+        const quest = validatedQuestFromSeed(selectedSeed, sessionWithChoice);
+        if (!quest) {
+          setCurrentSession({
+            ...sessionWithChoice,
+            questSeed: selectedSeed,
+            messages: [
+              ...sessionWithChoice.messages,
+              makeClaraMessage({
+                text: "I don't want to save a flimsy quest. What small practice would actually fit that aspiration?",
+                expectedInput: "text"
+              })
+            ]
+          });
+          setAnswer("");
+          return;
+        }
+
+        console.log("Quest created", quest);
+        setQuests((current) => [quest, ...current.filter((item) => item.id !== quest.id)]);
+        setCurrentSession({
+          ...sessionWithChoice,
+          questSeed: selectedSeed,
+          activeQuestId: quest.id,
+          messages: [
+            ...sessionWithChoice.messages,
+            makeClaraMessage({
+              text: questCreatedText(quest),
+              expectedInput: "choice",
+              choices: ["Keep going", "Done for today"]
+            })
+          ]
+        });
+        setAnswer("");
+        return;
+      }
+
       if (isQuestConfirmChoice(trimmed)) {
-        const aspirationText = latestQuestAspirationText(currentSession) || sessionText(currentSession) || trimmed;
-        const quest = questFromText(aspirationText, currentSession);
+        const quest = validatedQuestFromSeed(enrichedSeed, sessionWithChoice);
+        if (!quest) {
+          setCurrentSession({
+            ...sessionWithChoice,
+            messages: [
+              ...sessionWithChoice.messages,
+              makeClaraMessage({
+                text: "I don't want to turn the wrong thing into a quest. What is the small practice you want to try?",
+                expectedInput: "text"
+              })
+            ]
+          });
+          setAnswer("");
+          return;
+        }
+
         console.log("Quest created", quest);
         setQuests((current) => [quest, ...current.filter((item) => item.id !== quest.id)]);
         setCurrentSession({
@@ -4973,10 +5350,34 @@ export default function Home() {
     }
 
     if (routedAs === "quest_goal" && !quest) {
-      setCurrentSession({
+      const seed = questSeedForSession(routedSession, trimmed);
+      const seededSession: CurrentSession = {
         ...routedSession,
+        questSeed: seed
+      };
+
+      if (isQuestPracticeIdeaRequest(trimmed)) {
+        const enrichedSeed = enrichQuestSeedWithPracticeOptions(seed);
+        setCurrentSession({
+          ...seededSession,
+          questSeed: enrichedSeed,
+          messages: [
+            ...seededSession.messages,
+            makeClaraMessage({
+              text: questIdeasText(enrichedSeed),
+              expectedInput: "choice",
+              choices: [...questPracticeChoiceLabels(enrichedSeed), "Make it a quest", "Keep talking", "Not now"]
+            })
+          ]
+        });
+        setAnswer("");
+        return;
+      }
+
+      setCurrentSession({
+        ...seededSession,
         messages: [
-          ...routedSession.messages,
+          ...seededSession.messages,
           makeClaraMessage({
             text: "That sounds like something worth practicing, not just thinking about. Want to turn it into a small quest for the week?",
             expectedInput: "choice",
