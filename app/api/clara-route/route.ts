@@ -67,7 +67,7 @@ Rules:
 - If there is a messy choice or tradeoff about what to do, prefer decision_frame.
 - If the user is preparing to enter a situation, prefer orientation.
 - If the user is trying to build a practice, habit, or longer growth path, prefer quest_goal.
-- If the user says "I want to...", "I'm trying to...", "I want to become...", "I need to get better at...", or wants to be more present/write more/be healthier/be a better leader/parent/creator, prefer quest_goal unless it is clearly a decision or safety issue.
+- If the user says "I want to...", "I'd like to...", "I'm trying to...", "I want to become...", "I need to get better at...", or wants to run more/write more/be more present/be healthier/be a better leader/parent/creator, prefer quest_goal unless it is clearly a decision or safety issue.
 `.trim();
 
 export async function POST(request: Request) {
@@ -187,14 +187,17 @@ function fallbackRoute(text: string): RouteClassification {
 
   if (
     /\b(goal|habit|aspiration|becoming|practice|growth challenge)\b/.test(lower) ||
-    /\bi want to (be|become|write|create|make|practice|build|get better|be more|show up|lead|parent|exercise|eat|sleep|move)\b/.test(
+    /\bi want to (be|become|write|run|running|create|make|practice|build|get better|be more|show up|lead|parent|exercise|eat|sleep|move|start)\b/.test(
       lower
     ) ||
-    /\bi'?m trying to (be|become|write|create|make|practice|build|get better|be more|show up|lead|parent|exercise|eat|sleep|move)\b/.test(
+    /\bi'?m trying to (be|become|write|run|running|create|make|practice|build|get better|be more|show up|lead|parent|exercise|eat|sleep|move|start)\b/.test(
+      lower
+    ) ||
+    /\bi'?d like to (be|become|write|run|running|create|make|practice|build|get better|be more|show up|lead|parent|exercise|eat|sleep|move|start)\b/.test(
       lower
     ) ||
     /\bi need to get better at\b/.test(lower) ||
-    /\b(be more present|write more|be healthier|better leader|better parent|better creator)\b/.test(lower)
+    /\b(be more present|write more|be healthier|start running|running more|run more|better leader|better parent|better creator)\b/.test(lower)
   ) {
     return { route: "quest_goal", confidence: 0.58, reason: "Goal or practice language.", ...routeMetadata("quest_goal") };
   }
